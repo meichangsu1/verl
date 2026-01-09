@@ -1055,3 +1055,398 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         return {"values": values}
+
+
+@EngineRegistry.register(model_type="language_model_with_speculator", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
+    """
+    Language model engine with a speculator for speculative decoding training.
+    """
+
+    def __init__(
+        self,
+        model_config: HFModelConfig,
+        engine_config: FSDPEngineConfig,
+        optimizer_config: FSDPOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+        self.speculator = None
+        self.speculator_config = getattr(model_config, "speculator", None)
+
+    def _build_module(self):
+        import types
+        import torch
+        from typing import Optional
+        
+        module = super()._build_module()
+        
+        # Create speculator if config is provided
+        if self.speculator_config is not None:
+            # Get model dimensions
+            hidden_size = module.config.hidden_size
+            vocab_size = module.config.vocab_size
+            
+            # Create speculator config
+            speculator_config_dict = {
+                'n_predict': self.speculator_config.get('n_predict', 5),
+                'input_hidden_dim': hidden_size,
+                'inner_dim': str(self.speculator_config.get('inner_dim', hidden_size)),
+                'emb_dim': str(self.speculator_config.get('emb_dim', hidden_size)),
+                'proj_dim': str(self.speculator_config.get('proj_dim', hidden_size)),
+                'vocab_size': vocab_size,
+                'scale_input': self.speculator_config.get('scale_input', False),
+                'tie_weights': self.speculator_config.get('tie_weights', False),
+                'tie_lstm_embs': self.speculator_config.get('tie_lstm_embs', False),
+                'method': self.speculator_config.get('method', 'sum_rnn'),
+            }
+            
+            from verl.models.transformers.speculator import create_speculator_from_config
+            self.speculator = create_speculator_from_config(speculator_config_dict)
+            
+            # Attach speculator as a submodule
+            module.speculator = self.speculator
+            
+            # Store the original forward method
+            module.old_forward = module.forward
+            
+            # Create a new forward method that supports speculator_return parameter
+            def forward_with_speculator(
+                self,
+                input_ids: torch.LongTensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_values=None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                labels: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                return_dict: Optional[bool] = None,
+                speculator_return: bool = False,
+            ):
+                """Forward pass of the SpeculatorModel.
+                Returns:
+                    torch.Tensor: A tensor containing predictions from all Medusa heads.
+                    (Optional) Original predictions from the base model's LM head.
+                """
+
+                if not speculator_return:
+                    return self.old_forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                    )
+
+                # Pass input through the base model
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
+
+                return outputs
+            
+            # Bind the new forward method to the module
+            module.forward = types.MethodType(forward_with_speculator, module)
+            
+            # Freeze base model parameters when speculator is present
+            # This ensures only speculator is trained during speculative decoding training
+            # Freeze all parameters of the base model
+            for param in module.parameters():
+                param.requires_grad = False
+                
+            # Unfreeze speculator parameters
+            for param in module.speculator.parameters():
+                param.requires_grad = True
+                
+            # Move speculator to appropriate device and dtype
+            module.speculator.to(module.dtype).to(module.device)
+            
+            # Reset speculator parameters
+            module.speculator.reset_parameters()
+            
+        return module
+
+    def prepare_model_inputs(self, micro_batch: TensorDict):
+        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+        # Ensure we get hidden states for speculator
+        model_inputs["output_hidden_states"] = True
+        return model_inputs, output_args
+
+    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
+        """
+        Prepare model outputs for speculator training.
+        
+        For speculator training, we need both base model outputs (for base loss) 
+        and speculator outputs (for speculator loss).
+        """
+        # Get base model outputs (log_probs, entropy, etc.)
+        model_output = super().prepare_model_outputs(output, output_args, micro_batch)
+        
+        # If speculator is present, we'll compute speculator outputs separately in forward_step
+        # This method is kept for compatibility but speculator outputs are computed in forward_step
+        return model_output
+
+    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        device_name = get_device_name()
+        micro_batch = micro_batch.to(get_device_id())
+        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+
+        with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            # If speculator is present, we need to compute speculator loss
+            if self.speculator is not None and not forward_only:
+                # First, get hidden states from the base model with no_grad
+                with torch.no_grad():
+                    raw_output = self.module(
+                        **model_inputs,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+                    # Get the last hidden state
+                    hidden_states = raw_output.hidden_states[-1]
+                
+                # Prepare inputs for speculator
+                use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+                input_ids = micro_batch["input_ids"]
+                n_predict = self.speculator.n_predict
+                
+                if use_remove_padding:
+                    # hidden_states shape: (1, total_nnz, hidden_dim)
+                    hidden_states = hidden_states.squeeze(0)  # (total_nnz, hidden_dim)
+                    input_ids_flat = input_ids.values()  # (total_nnz,)
+                    
+                    # Slice hidden_states to remove last n_predict+1 tokens
+                    # Since we have flattened sequence, we need to handle per-sample lengths
+                    # For simplicity, we'll use the full hidden_states and adjust loss later
+                    hidden_states = hidden_states.unsqueeze(0)  # (1, total_nnz, hidden_dim)
+                    
+                    # Create inds: input_ids shifted right by 1
+                    pad = torch.zeros(n_predict, dtype=input_ids_flat.dtype, device=input_ids_flat.device)
+                    inds = torch.cat([input_ids_flat, pad]).unsqueeze(0)  # (1, total_nnz + n_predict)
+                else:
+                    # Not using remove_padding
+                    # hidden_states shape: (batch, seq_len, hidden_dim)
+                    # Slice hidden_states to remove last n_predict+1 tokens
+                    hidden_states = hidden_states[:, : -n_predict - 1, :]
+                    # inds is input_ids shifted right by 1
+                    inds = input_ids[:, 1:]  # (batch, seq_len-1)
+                    # Pad with zeros on the right for extra n_predict tokens
+                    batch_size, seq_len = inds.shape
+                    pad = torch.zeros(batch_size, n_predict, dtype=inds.dtype, device=inds.device)
+                    inds = torch.cat([inds, pad], dim=1)  # (batch, seq_len-1 + n_predict)
+                
+                # Call speculator forward
+                spec_logits = self.speculator(hidden_states, inds)  # (n_predict, b, n, vocab_size)
+                
+                # Compute speculator loss
+                pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+                loss_mask = micro_batch["loss_mask"]
+                input_ids = micro_batch["input_ids"]
+                
+                spec_loss_total = 0.0
+                for i in range(n_predict):
+                    if use_remove_padding:
+                        # spec_logits[i] shape: (1, total_nnz, vocab_size)
+                        logits_i = spec_logits[i].squeeze(0)  # (total_nnz, vocab_size)
+                        input_ids_flat = input_ids.values()
+                        loss_mask_flat = loss_mask.values()
+                        
+                        # Targets are shifted by i+2
+                        targets = torch.roll(input_ids_flat, shifts=-(i+2), dims=0)
+                        # Shift loss mask by i+2
+                        loss_mask_shifted = torch.roll(loss_mask_flat, shifts=-(i+2), dims=0)
+                        
+                        # Compute cross-entropy loss
+                        ce_loss = torch.nn.functional.cross_entropy(
+                            logits_i, 
+                            targets, 
+                            reduction='none'
+                        )
+                        # Mask out invalid positions
+                        ce_loss_masked = ce_loss * loss_mask_shifted
+                        # Sum over all tokens
+                        head_loss = ce_loss_masked.sum() / loss_mask_shifted.sum().clamp(min=1)
+                    else:
+                        # Not using remove_padding
+                        logits_i = spec_logits[i]  # (batch, n, vocab_size)
+                        batch_size, n = logits_i.shape[:2]
+                        
+                        # Targets are labels[:, i+2 : n + i+2]
+                        # We'll use input_ids as labels
+                        start = i + 2
+                        end = start + n
+                        targets = input_ids[:, start:end]  # (batch, n)
+                        loss_mask_i = loss_mask[:, start:end]
+                        
+                        # Compute cross-entropy loss
+                        ce_loss = torch.nn.functional.cross_entropy(
+                            logits_i.reshape(-1, logits_i.shape[-1]),
+                            targets.reshape(-1),
+                            reduction='none'
+                        ).view(batch_size, -1)
+                        ce_loss_masked = ce_loss * loss_mask_i
+                        head_loss = ce_loss_masked.sum() / loss_mask_i.sum().clamp(min=1)
+                    
+                    spec_loss_total += head_loss / n_predict
+                
+                # Scale speculator loss by a coefficient (could be configurable)
+                spec_coeff = getattr(self.model_config, "speculator_loss_coeff", 1.0)
+                spec_loss = spec_coeff * spec_loss_total
+                
+                # Also compute base model loss (optional, could be zero if we only train speculator)
+                # For now, we'll compute base model loss as well
+                base_model_output = self.prepare_model_outputs(
+                    output=raw_output, output_args=output_args, micro_batch=micro_batch
+                )
+                
+                if loss_function is not None:
+                    base_loss, metrics = loss_function(
+                        model_output=base_model_output, 
+                        data=micro_batch, 
+                        dp_group=self.get_data_parallel_group()
+                    )
+                    # Combine base loss and speculator loss
+                    total_loss = base_loss + spec_loss
+                else:
+                    total_loss = spec_loss
+                    metrics = {}
+                
+                # Add speculator loss to metrics
+                metrics["speculator_loss"] = spec_loss.detach().item()
+                
+                output = {
+                    "model_output": {**base_model_output, "spec_logits": spec_logits},
+                    "loss": total_loss.detach().item(),
+                    "metrics": metrics,
+                }
+                
+                return total_loss, output
+            else:
+                # No speculator or forward_only mode, use parent implementation
+                return super().forward_step(micro_batch, loss_function, forward_only)
+
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: Optional[str] = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Save speculator checkpoint only (similar to LoRA), not the base model.
+        
+        Args:
+            local_path: Directory to save the speculator checkpoint
+            hdfs_path: Optional HDFS path for distributed storage
+            global_step: Current training step
+            max_ckpt_to_keep: Maximum number of checkpoints to keep
+        """
+        import os
+        import json
+        import torch
+        
+        if self.speculator is None:
+            logger.warning("No speculator found, skipping speculator checkpoint save.")
+            return
+        
+        # Ensure save directory exists
+        os.makedirs(local_path, exist_ok=True)
+        
+        # Get the speculator state dict
+        # If speculator is wrapped in FSDP, we need to get the full state dict
+        speculator_module = self.speculator
+        if hasattr(self.module, 'speculator'):
+            # The speculator is attached to the module
+            speculator_module = self.module.speculator
+        
+        # Save the speculator state dict
+        state_dict_path = os.path.join(local_path, "pytorch_model.bin")
+        
+        # Handle FSDP wrapping if applicable
+        if hasattr(speculator_module, '_fsdp_wrapped_module'):
+            # Speculator is wrapped in FSDP, need to get full state dict
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+            
+            # Set state dict type to FULL_STATE_DICT
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            )
+            
+            # Get full state dict
+            state_dict = speculator_module.state_dict()
+            
+            # Save only on rank 0
+            if torch.distributed.get_rank() == 0:
+                torch.save(state_dict, state_dict_path)
+                logger.info(f"Saved speculator state dict to {state_dict_path}")
+            
+            # Reset state dict type
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        else:
+            # Regular module, just save the state dict
+            state_dict = speculator_module.state_dict()
+            torch.save(state_dict, state_dict_path)
+            logger.info(f"Saved speculator state dict to {state_dict_path}")
+        
+        # Save the speculator config
+        config_path = os.path.join(local_path, "config.json")
+        
+        # Get config from speculator
+        if hasattr(speculator_module, 'config'):
+            config_dict = speculator_module.config.__dict__
+        else:
+            # Create config from speculator attributes
+            config_dict = {
+                'n_predict': speculator_module.n_predict,
+                'input_hidden_dim': speculator_module.input_hidden_dim,
+                'inner_dim': speculator_module.inner_dim,
+                'emb_dim': speculator_module.emb_dim,
+                'proj_dim': speculator_module.proj_dim,
+                'vocab_size': speculator_module.vocab_size,
+                'scale_input': speculator_module.scale_input,
+                'tie_weights': speculator_module.tie_weights,
+                'tie_lstm_embs': speculator_module.tie_lstm_embs,
+                'method': speculator_module.method,
+            }
+        
+        # Save config only on rank 0
+        if torch.distributed.get_rank() == 0:
+            with open(config_path, 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            logger.info(f"Saved speculator config to {config_path}")
+        
+        # Sync all processes
+        torch.distributed.barrier()
+        
+        # If HDFS path is provided, upload the checkpoint
+        if hdfs_path is not None:
+            from verl.utils.fs import upload_to_hdfs
+            upload_to_hdfs(local_path, hdfs_path)
+        
+        # Handle checkpoint rotation if max_ckpt_to_keep is specified
+        if max_ckpt_to_keep is not None and torch.distributed.get_rank() == 0:
+            from verl.utils.checkpoint.checkpoint_handler import rotate_checkpoints
+            rotate_checkpoints(local_path, max_ckpt_to_keep)
+        
+        return state_dict_path, config_path
