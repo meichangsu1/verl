@@ -65,7 +65,7 @@ trainer:
   total_training_steps: null
   logger: [ 'console', 'wandb' ]
   seed: 1
-  save_freq: -1
+  save_freq: 2
   test_freq: -1
   nnodes: 1
   n_gpus_per_node: 8
