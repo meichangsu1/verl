@@ -82,6 +82,7 @@ from verl.utils.ulysses import (
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.trainer.speculators.interface import build_speculator_adapter
+from verl.trainer.speculators.interface import build_speculator_adapter
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -232,15 +233,22 @@ class FSDPSFTTrainer:
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
-        self.speculator_adapter = build_speculator_adapter(
-            self.config,
-            self.model_config,
-            self.config.trainer.device,
-            self.device_mesh,
-            torch_dtype,
+        speculator_config = getattr(self.config.model, "speculator", None)
+        speculator_adapter_config = getattr(self.config.model, "speculator_adapter", None)
+        if speculator_config is not None or speculator_adapter_config is not None:
+            self.speculator_adapter = build_speculator_adapter(
+                self.config,
+                self.model_config,
+                self.config.trainer.device,
+                self.device_mesh,
+                torch_dtype,
+            )
+        else:
+            self.speculator_adapter = None
+        self.has_speculator = self.speculator_adapter.has_speculator if self.speculator_adapter is not None else False
+        self.freeze_base_model = (
+            self.speculator_adapter.freeze_base_model if self.speculator_adapter is not None else False
         )
-        self.has_speculator = self.speculator_adapter.has_speculator
-        self.freeze_base_model = self.speculator_adapter.freeze_base_model
 
         # This may be very large
         init_context = get_init_weight_context_manager(
@@ -299,10 +307,13 @@ class FSDPSFTTrainer:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         # Build and attach speculator before FSDP wrapping to ensure it is sharded.
-        self.speculator = self.speculator_adapter.build_and_attach(
-            self.model,
-            attach_to_model=True,
-        )
+        if self.speculator_adapter is not None:
+            self.speculator = self.speculator_adapter.build_and_attach(
+                self.model,
+                attach_to_model=True,
+            )
+        else:
+            self.speculator = None
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
@@ -360,10 +371,12 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
-        self.optimizer = build_optimizer(
-            self.speculator_adapter.get_optimizer_params(self.fsdp_model),
-            self.config.optim,
+        optimizer_params = (
+            self.speculator_adapter.get_optimizer_params(self.fsdp_model)
+            if self.speculator_adapter is not None
+            else self.fsdp_model.parameters()
         )
+        self.optimizer = build_optimizer(optimizer_params, self.config.optim)
 
 
         log_gpu_memory_usage("After initialize optimizer", logger=logger)
@@ -397,9 +410,17 @@ class FSDPSFTTrainer:
         """
 
         # clean device move
+        """
+        Compute base loss + speculator loss if applicable.
+        This version cleanly separates loss components.
+        """
+
+        # clean device move
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
+        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
+
         loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
@@ -414,7 +435,46 @@ class FSDPSFTTrainer:
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=False
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            # ========== BASE LM LOSS ==========
+            base_loss = torch.tensor(0.0, device=self.device_name)
+            if not self.has_speculator or not self.freeze_base_model:
+                # compute base forward
+                base_out = self.fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False
                 )
+                logits = base_out.logits[..., :-1, :]
+                labels = input_ids[:, 1:].contiguous()
+
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                flat_labels = labels.reshape(-1)
+
+                ce = loss_fct(flat_logits, flat_labels)
+                ce = ce * loss_mask  # mask paddings
+                base_loss = ce.sum() / loss_mask.sum().clamp(min=1)
+
+            # ========== SPECULATOR LOSS ==========
+            spec_loss = torch.tensor(0.0, device=self.device_name)
+            if self.has_speculator:
+                spec_loss = self.speculator_adapter.compute_speculator_loss(
+                    self.fsdp_model,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    loss_mask,
+                )
+
+            # ========== TOTAL ==========
+            total_loss = base_loss + spec_loss
+
+        # backward
+        if do_backward:
+            total_loss.backward()
+
+        return total_loss
                 logits = base_out.logits[..., :-1, :]
                 labels = input_ids[:, 1:].contiguous()
 
@@ -500,6 +560,7 @@ class FSDPSFTTrainer:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
 
+
         return {
             "train/loss": step_loss.detach().item(),
             "train/lr(1e-3)": lr * 1e3,
@@ -535,7 +596,8 @@ class FSDPSFTTrainer:
             local_path=local_global_step_folder, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep
         )
 
-        self.speculator_adapter.save_checkpoint(self.fsdp_model, local_global_step_folder)
+        if self.speculator_adapter is not None and self.has_speculator:
+            self.speculator_adapter.save_checkpoint(self.fsdp_model, local_global_step_folder)
 
         # Save dataloader state
         if self.device_mesh.get_rank() == 0:
@@ -618,7 +680,8 @@ class FSDPSFTTrainer:
             log_only_rank_0=True,
         )
 
-        self.speculator_adapter.load_checkpoint(self.fsdp_model, checkpoint_path, logger)
+        if self.speculator_adapter is not None and self.has_speculator:
+            self.speculator_adapter.load_checkpoint(self.fsdp_model, checkpoint_path, logger)
 
         # Always load dataloader state for StatefulDataLoader
         self._load_dataloader_state(checkpoint_path)
