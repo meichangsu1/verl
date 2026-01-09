@@ -1347,10 +1347,14 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
         **kwargs,
     ) -> None:
         """
-        Save speculator checkpoint only (similar to LoRA), not the base model.
+        Save checkpoint for speculator training.
+        
+        For speculator training, we save two types of checkpoints:
+        1. Base model checkpoint (if not frozen) - saved by parent class
+        2. Speculator checkpoint only (similar to LoRA) - saved separately
         
         Args:
-            local_path: Directory to save the speculator checkpoint
+            local_path: Directory to save the checkpoint
             hdfs_path: Optional HDFS path for distributed storage
             global_step: Current training step
             max_ckpt_to_keep: Maximum number of checkpoints to keep
@@ -1359,12 +1363,18 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
         import json
         import torch
         
+        # First, call parent's save_checkpoint to save base model if needed
+        # Note: If base model is frozen, parent's save_checkpoint might not save anything
+        # or might save optimizer states only
+        super().save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
+        
         if self.speculator is None:
             logger.warning("No speculator found, skipping speculator checkpoint save.")
             return
         
-        # Ensure save directory exists
-        os.makedirs(local_path, exist_ok=True)
+        # Create a separate directory for speculator checkpoint
+        speculator_dir = os.path.join(local_path, "speculator")
+        os.makedirs(speculator_dir, exist_ok=True)
         
         # Get the speculator state dict
         # If speculator is wrapped in FSDP, we need to get the full state dict
@@ -1374,7 +1384,7 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
             speculator_module = self.module.speculator
         
         # Save the speculator state dict
-        state_dict_path = os.path.join(local_path, "pytorch_model.bin")
+        state_dict_path = os.path.join(speculator_dir, "pytorch_model.bin")
         
         # Handle FSDP wrapping if applicable
         if hasattr(speculator_module, '_fsdp_wrapped_module'):
@@ -1410,7 +1420,7 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
             logger.info(f"Saved speculator state dict to {state_dict_path}")
         
         # Save the speculator config
-        config_path = os.path.join(local_path, "config.json")
+        config_path = os.path.join(speculator_dir, "config.json")
         
         # Get config from speculator
         if hasattr(speculator_module, 'config'):
@@ -1439,14 +1449,13 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
         # Sync all processes
         torch.distributed.barrier()
         
-        # If HDFS path is provided, upload the checkpoint
+        # If HDFS path is provided, upload the speculator checkpoint
         if hdfs_path is not None:
             from verl.utils.fs import upload_to_hdfs
-            upload_to_hdfs(local_path, hdfs_path)
+            speculator_hdfs_path = os.path.join(hdfs_path, "speculator")
+            upload_to_hdfs(speculator_dir, speculator_hdfs_path)
         
         # Handle checkpoint rotation if max_ckpt_to_keep is specified
         if max_ckpt_to_keep is not None and torch.distributed.get_rank() == 0:
             from verl.utils.checkpoint.checkpoint_handler import rotate_checkpoints
-            rotate_checkpoints(local_path, max_ckpt_to_keep)
-        
-        return state_dict_path, config_path
+            rotate_checkpoints(speculator_dir, max_ckpt_to_keep)
