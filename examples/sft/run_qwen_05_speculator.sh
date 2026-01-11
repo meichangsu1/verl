@@ -21,10 +21,12 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.response_key=extra_info \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
-    data.micro_batch_size_per_gpu=4 \
+    data.micro_batch_size_per_gpu=1 \
+    model.fsdp_config.model_dtype=bf16 \
     model.partial_pretrain=/root/autodl-tmp/qwen3_moe_small \
-    +model.speculator.n_predict=5 \
+    +model.speculator.n_predict=3 \
     +model.speculator.method=sum_lstm \
+    +model.speculator.tie_lstm_embs=true \
     +model.freeze_base_model=true \
     +model.speculator.tie_weights=true \
     trainer.default_local_dir=$save_path \
