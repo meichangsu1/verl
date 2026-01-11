@@ -158,13 +158,20 @@ class SpeculatorHelper:
         for i in range(n_predict):
             start = i + 2
             length = spec_logits.size(2)
-            targets = input_ids[:, start : start + length]
+            max_len = min(
+                length,
+                input_ids.size(1) - start,
+                loss_mask_matrix.size(1) - start,
+            )
+            if max_len <= 0:
+                continue
+            targets = input_ids[:, start : start + max_len]
 
-            logits_i = spec_logits[i].reshape(-1, vocab_size)
+            logits_i = spec_logits[i][:, :max_len, :].reshape(-1, vocab_size)
             labels_i = targets.reshape(-1)
 
             ce_i = loss_fct(logits_i, labels_i)
-            mask_i = loss_mask_matrix[:, start : start + length].reshape(-1)
+            mask_i = loss_mask_matrix[:, start : start + max_len].reshape(-1)
             ce_i = ce_i * mask_i
             spec_loss_accum += ce_i.sum() / mask_i.sum().clamp(min=1)
 
