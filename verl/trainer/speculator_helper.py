@@ -1,0 +1,283 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+import os
+
+import torch
+from torch import nn
+from verl.utils.logger import log_with_rank
+
+
+class SpeculatorHelper:
+    def __init__(
+        self,
+        config,
+        model_config,
+        device_name,
+        device_mesh,
+        torch_dtype,
+        speculator_config=None,
+        freeze_base_model=None,
+    ):
+        self.config = config
+        self.model_config = model_config
+        self.device_name = device_name
+        self.device_mesh = device_mesh
+        self.torch_dtype = torch_dtype
+
+        if speculator_config is None:
+            if self.config is not None and hasattr(self.config, "model"):
+                speculator_config = getattr(self.config.model, "speculator", None)
+            else:
+                speculator_config = getattr(self.model_config, "speculator", None)
+        self.speculator_config = speculator_config
+        self.has_speculator = self.speculator_config is not None
+
+        if freeze_base_model is None:
+            if self.config is not None and hasattr(self.config, "model"):
+                freeze_base_model = getattr(self.config.model, "freeze_base_model", True)
+            else:
+                freeze_base_model = True
+        self.freeze_base_model = freeze_base_model
+
+        self.speculator = None
+
+    def build_and_attach(self, model):
+        if not self.has_speculator:
+            return None
+
+        hf_config = self.model_config.hf_config if hasattr(self.model_config, "hf_config") else self.model_config
+        hidden_size = hf_config.hidden_size
+        vocab_size = hf_config.vocab_size
+
+        speculator_config_dict = {
+            "n_predict": self.speculator_config.get("n_predict", 5),
+            "input_hidden_dim": hidden_size,
+            "inner_dim": str(self.speculator_config.get("inner_dim", hidden_size)),
+            "emb_dim": str(self.speculator_config.get("emb_dim", hidden_size)),
+            "proj_dim": str(self.speculator_config.get("proj_dim", hidden_size)),
+            "vocab_size": vocab_size,
+            "scale_input": self.speculator_config.get("scale_input", False),
+            "tie_weights": self.speculator_config.get("tie_weights", False),
+            "tie_lstm_embs": self.speculator_config.get("tie_lstm_embs", False),
+            "method": self.speculator_config.get("method", "sum_rnn"),
+        }
+
+        from verl.models.transformers.speculator import create_speculator_from_config
+
+        self.speculator = create_speculator_from_config(speculator_config_dict)
+        model.speculator = self.speculator
+
+        if self.freeze_base_model:
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in self.speculator.parameters():
+                param.requires_grad = True
+
+        self.speculator.to(dtype=self.torch_dtype)
+        self.speculator.reset_parameters()
+
+        if self.device_mesh.get_rank() == 0:
+            print(f"Created speculator with config: {speculator_config_dict}")
+            print(f"Freeze base model: {self.freeze_base_model}")
+
+        return self.speculator
+
+    def get_optimizer_params(self, fsdp_model):
+        if self.has_speculator and self.freeze_base_model:
+            return fsdp_model.speculator.parameters()
+        return fsdp_model.parameters()
+
+    def _get_speculator_module(self, fsdp_model):
+        if self.speculator is not None:
+            return self.speculator
+        if hasattr(fsdp_model, "speculator"):
+            return fsdp_model.speculator
+        return None
+
+    def compute_speculator_loss(
+        self,
+        fsdp_model,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        loss_mask=None,
+        hidden_states=None,
+        spec_logits=None,
+    ):
+        if not self.has_speculator:
+            return torch.tensor(0.0, device=self.device_name)
+
+        speculator_module = self._get_speculator_module(fsdp_model)
+        if speculator_module is None:
+            return torch.tensor(0.0, device=self.device_name)
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+        if hidden_states is None:
+            with torch.no_grad():
+                hidden_out = fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+                hidden = hidden_out.hidden_states[-1]
+        else:
+            hidden = hidden_states
+        if spec_logits is None:
+            spec_logits = self.compute_speculator_logits(fsdp_model, input_ids, hidden)
+
+        n_predict = speculator_module.n_predict
+        vocab_size = spec_logits.size(-1)
+
+        spec_loss_accum = 0.0
+        loss_mask_matrix = loss_mask.reshape(input_ids.size(0), -1)
+        for i in range(n_predict):
+            start = i + 2
+            length = spec_logits.size(2)
+            targets = input_ids[:, start : start + length]
+
+            logits_i = spec_logits[i].reshape(-1, vocab_size)
+            labels_i = targets.reshape(-1)
+
+            ce_i = loss_fct(logits_i, labels_i)
+            mask_i = loss_mask_matrix[:, start : start + length].reshape(-1)
+            ce_i = ce_i * mask_i
+            spec_loss_accum += ce_i.sum() / mask_i.sum().clamp(min=1)
+
+        spec_loss = spec_loss_accum / n_predict
+        return spec_loss
+
+    def compute_speculator_logits(self, fsdp_model, input_ids, hidden_states):
+        speculator_module = self._get_speculator_module(fsdp_model)
+        if speculator_module is None:
+            return None
+
+        n_predict = speculator_module.n_predict
+        hidden = hidden_states[:, : -(n_predict + 1), :]
+        seq_ids = input_ids[:, 1:]
+        pad_ids = torch.zeros(input_ids.size(0), n_predict, dtype=seq_ids.dtype, device=seq_ids.device)
+        spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
+
+        spec_logits = speculator_module(hidden, spec_inds)
+        return spec_logits
+
+    def save_checkpoint(self, fsdp_model, local_global_step_folder):
+        if not self.has_speculator:
+            return
+
+        speculator_dir = os.path.join(local_global_step_folder, "speculator")
+        os.makedirs(speculator_dir, exist_ok=True)
+
+        speculator_module = self._get_speculator_module(fsdp_model)
+        if speculator_module is None:
+            return
+
+        state_dict_path = os.path.join(speculator_dir, "pytorch_model.bin")
+        if hasattr(speculator_module, "_fsdp_wrapped_module"):
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            )
+            state_dict = speculator_module.state_dict()
+            if torch.distributed.get_rank() == 0:
+                torch.save(state_dict, state_dict_path)
+                print(f"Saved speculator state dict to {state_dict_path}")
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        else:
+            state_dict = speculator_module.state_dict()
+            if torch.distributed.get_rank() == 0:
+                torch.save(state_dict, state_dict_path)
+                print(f"Saved speculator state dict to {state_dict_path}")
+
+        config_path = os.path.join(speculator_dir, "config.json")
+        if hasattr(speculator_module, "config"):
+            config_dict = speculator_module.config.__dict__
+        else:
+            config_dict = {
+                "n_predict": speculator_module.n_predict,
+                "input_hidden_dim": speculator_module.input_hidden_dim,
+                "inner_dim": speculator_module.inner_dim,
+                "emb_dim": speculator_module.emb_dim,
+                "proj_dim": speculator_module.proj_dim,
+                "vocab_size": speculator_module.vocab_size,
+                "scale_input": speculator_module.scale_input,
+                "tie_weights": speculator_module.tie_weights,
+                "tie_lstm_embs": speculator_module.tie_lstm_embs,
+                "method": speculator_module.method,
+            }
+
+        if torch.distributed.get_rank() == 0:
+            with open(config_path, "w") as f:
+                json.dump(config_dict, f, indent=2)
+            print(f"Saved speculator config to {config_path}")
+
+    def load_checkpoint(self, fsdp_model, checkpoint_path, logger):
+        if not self.has_speculator:
+            return
+
+        speculator_dir = os.path.join(checkpoint_path, "speculator")
+        state_dict_path = os.path.join(speculator_dir, "pytorch_model.bin")
+        if not os.path.exists(state_dict_path):
+            log_with_rank(
+                f"Warning: No speculator checkpoint found at {state_dict_path}, starting from scratch",
+                logger=logger,
+                rank=self.device_mesh.get_rank(),
+                level=logging.WARNING,
+                log_only_rank_0=True,
+            )
+            return
+
+        state_dict = torch.load(state_dict_path, map_location="cpu")
+
+        speculator_module = self._get_speculator_module(fsdp_model)
+        if speculator_module is None:
+            return
+
+        if hasattr(speculator_module, "_fsdp_wrapped_module"):
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            )
+            speculator_module.load_state_dict(state_dict)
+            FSDP.set_state_dict_type(
+                speculator_module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        else:
+            speculator_module.load_state_dict(state_dict)
+
+        log_with_rank(
+            f"Successfully loaded speculator checkpoint from {state_dict_path}",
+            logger=logger,
+            rank=self.device_mesh.get_rank(),
+            log_only_rank_0=True,
+        )

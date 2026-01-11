@@ -81,6 +81,7 @@ from verl.utils.ulysses import (
 )
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.trainer.speculator_helper import SpeculatorHelper
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -231,11 +232,15 @@ class FSDPSFTTrainer:
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
-        # Check if speculator config is present
-        self.speculator_config = getattr(self.config.model, "speculator", None)
-        self.has_speculator = self.speculator_config is not None
-        self.freeze_base_model = getattr(self.config.model, "freeze_base_model", True)
-        self.speculator_loss_coeff = getattr(self.config.model, "speculator_loss_coeff", 1.0)
+        self.speculator_helper = SpeculatorHelper(
+            self.config,
+            self.model_config,
+            self.config.trainer.device,
+            self.device_mesh,
+            torch_dtype,
+        )
+        self.has_speculator = self.speculator_helper.has_speculator
+        self.freeze_base_model = self.speculator_helper.freeze_base_model
 
         # This may be very large
         init_context = get_init_weight_context_manager(
@@ -262,51 +267,7 @@ class FSDPSFTTrainer:
 
                 _apply_liger_kernel_to_instance(model=self.model)
 
-            # Create speculator if config is provided
-            if self.has_speculator:
-                # Get model dimensions
-                hidden_size = config.hidden_size
-                vocab_size = config.vocab_size
-                
-                # Create speculator config
-                speculator_config_dict = {
-                    'n_predict': self.speculator_config.get('n_predict', 5),
-                    'input_hidden_dim': hidden_size,
-                    'inner_dim': str(self.speculator_config.get('inner_dim', hidden_size)),
-                    'emb_dim': str(self.speculator_config.get('emb_dim', hidden_size)),
-                    'proj_dim': str(self.speculator_config.get('proj_dim', hidden_size)),
-                    'vocab_size': vocab_size,
-                    'scale_input': self.speculator_config.get('scale_input', False),
-                    'tie_weights': self.speculator_config.get('tie_weights', False),
-                    'tie_lstm_embs': self.speculator_config.get('tie_lstm_embs', False),
-                    'method': self.speculator_config.get('method', 'sum_rnn'),
-                }
-                
-                from verl.models.transformers.speculator import create_speculator_from_config
-                self.speculator = create_speculator_from_config(speculator_config_dict)
-                
-                # Attach speculator as a submodule
-                self.model.speculator = self.speculator
-                
-                # Freeze base model parameters when speculator is present
-                if self.freeze_base_model:
-                    for param in self.model.parameters():
-                        param.requires_grad = False
-                    
-                    # Unfreeze speculator parameters
-                    for param in self.speculator.parameters():
-                        param.requires_grad = True
-                
-                # Move speculator to appropriate device and dtype
-                self.speculator.to(torch_dtype)
-                
-                # Reset speculator parameters
-                self.speculator.reset_parameters()
-                
-                if self.device_mesh.get_rank() == 0:
-                    print(f"Created speculator with config: {speculator_config_dict}")
-                    print(f"Freeze base model: {self.freeze_base_model}")
-                    print(f"Speculator loss coefficient: {self.speculator_loss_coeff}")
+            self.speculator = self.speculator_helper.build_and_attach(self.model)
 
             if self.lora:
                 self.model.enable_input_require_grads()
@@ -395,7 +356,11 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
-        self.optimizer = build_optimizer(self.fsdp_model.parameters(), self.config.optim)
+        self.optimizer = build_optimizer(
+            self.speculator_helper.get_optimizer_params(self.fsdp_model),
+            self.config.optim,
+        )
+
 
         log_gpu_memory_usage("After initialize optimizer", logger=logger)
 
@@ -422,176 +387,59 @@ class FSDPSFTTrainer:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
     def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Compute loss with optional sequence parallelism and remove padding features"""
-        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+        """
+        Compute base loss + speculator loss if applicable.
+        This version cleanly separates loss components.
+        """
 
-        # Move inputs to GPU and prepare loss mask
+        # clean device move
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
-        # Context manager for sequence parallel if needed
-        context = self.sharding_manager if use_sp else nullcontext()
-        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                # Standard forward pass without sequence parallel
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            # ========== BASE LM LOSS ==========
+            base_loss = torch.tensor(0.0, device=self.device_name)
+            if not self.has_speculator or not self.freeze_base_model:
+                # compute base forward
+                base_out = self.fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False
+                )
+                logits = base_out.logits[..., :-1, :]
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
-                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
-                )
-                logits = output.logits
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels.contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
-                
-                # Compute speculator loss if speculator is present
-                spec_loss = torch.tensor(0.0, device=self.device_name)
-                if self.has_speculator and not do_backward:
-                    # For speculator training, we need to compute speculator loss
-                    # This is a simplified version - in practice, we'd need to compute
-                    # speculator predictions and compare with future tokens
-                    n_predict = self.speculator.n_predict
-                    batch_size, seq_len = input_ids.shape
-                    
-                    # Get hidden states from the base model
-                    with torch.no_grad():
-                        hidden_output = self.fsdp_model(
-                            input_ids=input_ids, 
-                            attention_mask=attention_mask, 
-                            position_ids=position_ids, 
-                            use_cache=False,
-                            output_hidden_states=True
-                        )
-                        hidden_states = hidden_output.hidden_states[-1]  # (batch, seq_len, hidden_dim)
-                    
-                    # Prepare inputs for speculator
-                    # We need to shift the input_ids for each prediction head
-                    spec_loss_total = 0.0
-                    for i in range(n_predict):
-                        # For head i, we predict tokens at position i+2
-                        start = i + 2
-                        if start >= seq_len:
-                            continue
-                            
-                        # Get hidden states for prediction (up to seq_len - start)
-                        hidden_i = hidden_states[:, :seq_len-start, :]
-                        
-                        # Get target tokens (shifted by start)
-                        targets = input_ids[:, start:seq_len]
-                        
-                        # Prepare input_ids for speculator (shifted by 1)
-                        inds = input_ids[:, 1:seq_len-start+1]
-                        
-                        # Pad with zeros for extra n_predict tokens
-                        pad = torch.zeros(batch_size, n_predict, dtype=inds.dtype, device=inds.device)
-                        inds = torch.cat([inds, pad], dim=1)
-                        
-                        # Call speculator forward
-                        spec_logits_i = self.speculator(hidden_i, inds)  # (n_predict, batch, n, vocab_size)
-                        
-                        # Get predictions for head i
-                        pred_logits = spec_logits_i[i]  # (batch, n, vocab_size)
-                        n = pred_logits.shape[1]
-                        
-                        # Compute cross-entropy loss
-                        ce_loss = loss_fct(
-                            pred_logits.reshape(-1, pred_logits.shape[-1]),
-                            targets[:, :n].reshape(-1)
-                        ).view(batch_size, -1)
-                        
-                        # Apply loss mask
-                        loss_mask_i = loss_mask.view(batch_size, -1)[:, :n]
-                        ce_loss_masked = ce_loss * loss_mask_i
-                        head_loss = ce_loss_masked.sum() / loss_mask_i.sum().clamp(min=1)
-                        
-                        spec_loss_total += head_loss / n_predict
-                    
-                    spec_loss = self.speculator_loss_coeff * spec_loss_total
-                    
-            else:
-                # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                # 1. All SP ranks will receive the *SAME* batch
-                # 2. Different SP groups will receive *DIFFERENT* batches
-                # This is implemented by the DistributedSampler
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                flat_labels = labels.reshape(-1)
 
-                batch_size, seqlen = input_ids.shape
-                # Remove padding
-                input_ids_rmpad, indices, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                ce = loss_fct(flat_logits, flat_labels)
+                ce = ce * loss_mask  # mask paddings
+                base_loss = ce.sum() / loss_mask.sum().clamp(min=1)
 
-                # Unpad position_ids to align rotary
-                position_ids_rmpad = index_first_axis(
-                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
-                ).transpose(0, 1)
-
-                # Pad and slice inputs for sequence parallelism
-                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
-                )
-                # For computing loss
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
-                )
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
-
-                # Forward pass
-                output = self.fsdp_model(
-                    input_ids=input_ids_rmpad_sliced,
-                    attention_mask=None,  # Not needed with flash attention varlen
-                    position_ids=position_ids_rmpad_padded,
-                    use_cache=False,
+            # ========== SPECULATOR LOSS ==========
+            spec_loss = torch.tensor(0.0, device=self.device_name)
+            if self.has_speculator:
+                spec_loss = self.speculator_helper.compute_speculator_loss(
+                    self.fsdp_model,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    loss_mask,
                 )
 
-                # Compute loss locally then aggregate
-                logits_rmpad = output.logits.squeeze(0)
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                # Gather and unpad for sequence parallelism
-                loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+            # ========== TOTAL ==========
+            total_loss = base_loss + spec_loss
 
-                # This is the loss collected from all ulysses ranks
-                full_loss = pad_input(
-                    hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-                )
-                full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
-                full_loss = full_loss.reshape(-1)
-                loss_mask = loss_mask.to(full_loss.device)
-                loss = full_loss * loss_mask
-                
-                # Note: Speculator training with sequence parallel is more complex
-                # For now, we'll skip speculator loss in this mode
-                spec_loss = torch.tensor(0.0, device=self.device_name)
+        # backward
+        if do_backward:
+            total_loss.backward()
 
-            valid_token_this_rank = torch.sum(loss_mask)
-
-            if self.config.data.balance_dp_token:
-                torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
-            else:
-                dp_size = 1
-
-            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
-            
-            # Combine base loss and speculator loss
-            total_loss = loss + spec_loss
-            total_loss = total_loss / n_micro_batches  # normalize loss
-
-            if do_backward:
-                total_loss.backward()
-            return total_loss
+        return total_loss
 
     def training_step(self, batch: TensorDict):
         start_time = time.time()
@@ -647,6 +495,7 @@ class FSDPSFTTrainer:
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
+
         return {
             "train/loss": step_loss.detach().item(),
             "train/lr(1e-3)": lr * 1e3,
@@ -682,81 +531,7 @@ class FSDPSFTTrainer:
             local_path=local_global_step_folder, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep
         )
 
-        # Save speculator checkpoint if speculator is present
-        if self.has_speculator:
-            speculator_dir = os.path.join(local_global_step_folder, "speculator")
-            os.makedirs(speculator_dir, exist_ok=True)
-            
-            # Get the speculator state dict
-            speculator_module = self.speculator
-            if hasattr(self.fsdp_model, 'speculator'):
-                # The speculator is attached to the fsdp_model
-                speculator_module = self.fsdp_model.speculator
-            
-            # Save the speculator state dict
-            state_dict_path = os.path.join(speculator_dir, "pytorch_model.bin")
-            
-            # Handle FSDP wrapping if applicable
-            if hasattr(speculator_module, '_fsdp_wrapped_module'):
-                # Speculator is wrapped in FSDP, need to get full state dict
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
-                
-                # Set state dict type to FULL_STATE_DICT
-                FSDP.set_state_dict_type(
-                    speculator_module,
-                    state_dict_type=StateDictType.FULL_STATE_DICT,
-                    state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-                )
-                
-                # Get full state dict
-                state_dict = speculator_module.state_dict()
-                
-                # Save only on rank 0
-                if torch.distributed.get_rank() == 0:
-                    torch.save(state_dict, state_dict_path)
-                    print(f"Saved speculator state dict to {state_dict_path}")
-                
-                # Reset state dict type
-                FSDP.set_state_dict_type(
-                    speculator_module,
-                    state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                    state_dict_config=FullStateDictConfig(),
-                )
-            else:
-                # Regular module, just save the state dict
-                state_dict = speculator_module.state_dict()
-                if torch.distributed.get_rank() == 0:
-                    torch.save(state_dict, state_dict_path)
-                    print(f"Saved speculator state dict to {state_dict_path}")
-            
-            # Save the speculator config
-            config_path = os.path.join(speculator_dir, "config.json")
-            
-            # Get config from speculator
-            if hasattr(speculator_module, 'config'):
-                config_dict = speculator_module.config.__dict__
-            else:
-                # Create config from speculator attributes
-                config_dict = {
-                    'n_predict': speculator_module.n_predict,
-                    'input_hidden_dim': speculator_module.input_hidden_dim,
-                    'inner_dim': speculator_module.inner_dim,
-                    'emb_dim': speculator_module.emb_dim,
-                    'proj_dim': speculator_module.proj_dim,
-                    'vocab_size': speculator_module.vocab_size,
-                    'scale_input': speculator_module.scale_input,
-                    'tie_weights': speculator_module.tie_weights,
-                    'tie_lstm_embs': speculator_module.tie_lstm_embs,
-                    'method': speculator_module.method,
-                }
-            
-            # Save config only on rank 0
-            if torch.distributed.get_rank() == 0:
-                import json
-                with open(config_path, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
-                print(f"Saved speculator config to {config_path}")
+        self.speculator_helper.save_checkpoint(self.fsdp_model, local_global_step_folder)
 
         # Save dataloader state
         if self.device_mesh.get_rank() == 0:
@@ -839,61 +614,7 @@ class FSDPSFTTrainer:
             log_only_rank_0=True,
         )
 
-        # Load speculator checkpoint if speculator is present
-        if self.has_speculator:
-            speculator_dir = os.path.join(checkpoint_path, "speculator")
-            state_dict_path = os.path.join(speculator_dir, "pytorch_model.bin")
-            config_path = os.path.join(speculator_dir, "config.json")
-            
-            if os.path.exists(state_dict_path):
-                # Load speculator state dict
-                state_dict = torch.load(state_dict_path, map_location="cpu")
-                
-                # Get the speculator module
-                speculator_module = self.speculator
-                if hasattr(self.fsdp_model, 'speculator'):
-                    speculator_module = self.fsdp_model.speculator
-                
-                # Handle FSDP wrapping if applicable
-                if hasattr(speculator_module, '_fsdp_wrapped_module'):
-                    # Speculator is wrapped in FSDP
-                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                    from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
-                    
-                    # Set state dict type to FULL_STATE_DICT for loading
-                    FSDP.set_state_dict_type(
-                        speculator_module,
-                        state_dict_type=StateDictType.FULL_STATE_DICT,
-                        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-                    )
-                    
-                    # Load state dict
-                    speculator_module.load_state_dict(state_dict)
-                    
-                    # Reset state dict type
-                    FSDP.set_state_dict_type(
-                        speculator_module,
-                        state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                        state_dict_config=FullStateDictConfig(),
-                    )
-                else:
-                    # Regular module, just load the state dict
-                    speculator_module.load_state_dict(state_dict)
-                
-                log_with_rank(
-                    f"Successfully loaded speculator checkpoint from {state_dict_path}",
-                    logger=logger,
-                    rank=self.device_mesh.get_rank(),
-                    log_only_rank_0=True,
-                )
-            else:
-                log_with_rank(
-                    f"Warning: No speculator checkpoint found at {state_dict_path}, starting from scratch",
-                    logger=logger,
-                    rank=self.device_mesh.get_rank(),
-                    level=logging.WARNING,
-                    log_only_rank_0=True,
-                )
+        self.speculator_helper.load_checkpoint(self.fsdp_model, checkpoint_path, logger)
 
         # Always load dataloader state for StatefulDataLoader
         self._load_dataloader_state(checkpoint_path)
