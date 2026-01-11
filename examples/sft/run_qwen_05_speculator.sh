@@ -22,10 +22,11 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size_per_gpu=4 \
-    model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
-    model.speculator.n_predict=5 \
-    model.speculator.method=sum_lstm \
-    model.freeze_base_model=true \
+    model.partial_pretrain=/root/autodl-tmp/qwen3_moe_small \
+    +model.speculator.n_predict=5 \
+    +model.speculator.method=sum_lstm \
+    +model.freeze_base_model=true \
+    +model.speculator.tie_weights=true \
     trainer.default_local_dir=$save_path \
     trainer.project_name=gsm8k-sft \
     trainer.experiment_name=gsm8k-sft-qwen-2.5-0.5b-instruct-speculator \
