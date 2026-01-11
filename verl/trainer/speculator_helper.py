@@ -55,7 +55,7 @@ class SpeculatorHelper:
 
         self.speculator = None
 
-    def build_and_attach(self, model):
+    def build_and_attach(self, model, attach_to_model=True):
         if not self.has_speculator:
             return None
 
@@ -73,13 +73,14 @@ class SpeculatorHelper:
             "scale_input": self.speculator_config.get("scale_input", False),
             "tie_weights": self.speculator_config.get("tie_weights", False),
             "tie_lstm_embs": self.speculator_config.get("tie_lstm_embs", False),
-            "method": self.speculator_config.get("method", "sum_rnn"),
+            "method": self.speculator_config.get("method", "sum_lstm"),
         }
 
         from verl.models.transformers.speculator import create_speculator_from_config
 
         self.speculator = create_speculator_from_config(speculator_config_dict)
-        model.speculator = self.speculator
+        if attach_to_model:
+            model.speculator = self.speculator
 
         if self.freeze_base_model:
             for param in model.parameters():
@@ -87,7 +88,7 @@ class SpeculatorHelper:
             for param in self.speculator.parameters():
                 param.requires_grad = True
 
-        self.speculator.to(dtype=self.torch_dtype)
+        self.speculator.to(device=self.device_name, dtype=self.torch_dtype)
         self.speculator.reset_parameters()
 
         if self.device_mesh.get_rank() == 0:
@@ -98,6 +99,8 @@ class SpeculatorHelper:
 
     def get_optimizer_params(self, fsdp_model):
         if self.has_speculator and self.freeze_base_model:
+            if self.speculator is not None:
+                return self.speculator.parameters()
             return fsdp_model.speculator.parameters()
         return fsdp_model.parameters()
 
@@ -167,6 +170,39 @@ class SpeculatorHelper:
         speculator_module = self._get_speculator_module(fsdp_model)
         if speculator_module is None:
             return None
+
+        if not hasattr(self, "_printed_tensor_types"):
+            self._printed_tensor_types = False
+        if not self._printed_tensor_types and self.device_mesh.get_rank() == 0:
+            try:
+                first_param = next(speculator_module.parameters())
+            except StopIteration:
+                first_param = None
+            print(
+                "Speculator tensor types: "
+                f"hidden_states={type(hidden_states)}, "
+                f"input_ids={type(input_ids)}, "
+                f"speculator_param={type(first_param)}"
+            )
+            self._printed_tensor_types = True
+
+        if hasattr(hidden_states, "to_local"):
+            try:
+                from torch.distributed.tensor import DTensor
+
+                if isinstance(hidden_states, DTensor):
+                    hidden_states = hidden_states.to_local()
+            except Exception:
+                hidden_states = hidden_states.to_local()
+
+        if hasattr(input_ids, "to_local"):
+            try:
+                from torch.distributed.tensor import DTensor
+
+                if isinstance(input_ids, DTensor):
+                    input_ids = input_ids.to_local()
+            except Exception:
+                input_ids = input_ids.to_local()
 
         n_predict = speculator_module.n_predict
         hidden = hidden_states[:, : -(n_predict + 1), :]

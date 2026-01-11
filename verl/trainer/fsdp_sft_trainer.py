@@ -267,8 +267,6 @@ class FSDPSFTTrainer:
 
                 _apply_liger_kernel_to_instance(model=self.model)
 
-            self.speculator = self.speculator_helper.build_and_attach(self.model)
-
             if self.lora:
                 self.model.enable_input_require_grads()
 
@@ -355,6 +353,12 @@ class FSDPSFTTrainer:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
+
+        attach_speculator = self.config.model.strategy != "fsdp2"
+        self.speculator = self.speculator_helper.build_and_attach(
+            self.fsdp_model,
+            attach_to_model=attach_speculator,
+        )
 
         self.optimizer = build_optimizer(
             self.speculator_helper.get_optimizer_params(self.fsdp_model),
