@@ -262,21 +262,51 @@ class SpeculatorHelper:
                 print(f"Saved speculator state dict to {state_dict_path}")
 
         config_path = os.path.join(speculator_dir, "config.json")
-        if hasattr(speculator_module, "config"):
-            config_dict = speculator_module.config.__dict__
-        else:
-            config_dict = {
-                "n_predict": speculator_module.n_predict,
-                "input_hidden_dim": speculator_module.input_hidden_dim,
-                "inner_dim": speculator_module.inner_dim,
-                "emb_dim": speculator_module.emb_dim,
-                "proj_dim": speculator_module.proj_dim,
-                "vocab_size": speculator_module.vocab_size,
-                "scale_input": speculator_module.scale_input,
-                "tie_weights": speculator_module.tie_weights,
-                "tie_lstm_embs": speculator_module.tie_lstm_embs,
-                "method": speculator_module.method,
-            }
+        hf_config = None
+        if self.model_config is not None:
+            hf_config = self.model_config.hf_config if hasattr(self.model_config, "hf_config") else self.model_config
+        base_archs = getattr(hf_config, "architectures", None) if hf_config is not None else None
+        base_model_name_or_path = None
+        if self.config is not None and hasattr(self.config, "model"):
+            base_model_name_or_path = getattr(self.config.model, "partial_pretrain", None)
+        if base_model_name_or_path is None and self.model_config is not None:
+            base_model_name_or_path = getattr(self.model_config, "local_path", None)
+
+        dtype_name = str(self.torch_dtype).replace("torch.", "") if self.torch_dtype is not None else None
+        try:
+            import transformers
+
+            transformers_version = transformers.__version__
+        except Exception:
+            transformers_version = None
+
+        def _format_dim(dim):
+            if isinstance(dim, int):
+                return str(dim)
+            if isinstance(dim, (list, tuple)):
+                return ".".join(str(v) for v in dim)
+            return str(dim)
+
+        config_dict = {
+            "architectures": ["ArcticLSTMSpeculatorPreTrainedModel"],
+            "base_model_name_or_path": base_model_name_or_path,
+            "base_model_archs": base_archs or [],
+            "input_hidden_dim": speculator_module.input_hidden_dim,
+            "inner_dim": _format_dim(speculator_module.inner_dim),
+            "proj_dim": _format_dim(speculator_module.proj_dim),
+            "emb_dim": _format_dim(speculator_module.emb_dim),
+            "model_type": "mlp_speculator",
+            "n_candidates": speculator_module.n_predict,
+            "n_predict": speculator_module.n_predict,
+            "scale_input": speculator_module.scale_input,
+            "tie_weights": speculator_module.tie_weights,
+            "tie_lstm_embs": speculator_module.tie_lstm_embs,
+            "top_k_tokens_per_head": [1 for _ in range(speculator_module.n_predict)],
+            "torch_dtype": dtype_name,
+            "transformers_version": transformers_version,
+            "vocab_size": speculator_module.vocab_size,
+            "method": speculator_module.method,
+        }
 
         if torch.distributed.get_rank() == 0:
             with open(config_path, "w") as f:
