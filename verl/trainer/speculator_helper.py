@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import types
 
 import torch
 from torch import nn
@@ -76,9 +77,13 @@ class SpeculatorHelper:
             "method": self.speculator_config.get("method", "sum_lstm"),
         }
 
-        from verl.models.transformers.speculator import create_speculator_from_config
+        from verl.models.transformers import speculator as speculator_mod
 
-        self.speculator = create_speculator_from_config(speculator_config_dict)
+        if hasattr(speculator_mod, "create_speculator_from_config"):
+            self.speculator = speculator_mod.create_speculator_from_config(speculator_config_dict)
+        else:
+            config_obj = types.SimpleNamespace(**speculator_config_dict)
+            self.speculator = speculator_mod.ArcticLSTMSpeculator(config_obj)
         if attach_to_model:
             model.speculator = self.speculator
 

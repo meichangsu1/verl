@@ -1056,168 +1056,168 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
 
         return {"values": values}
 
-from typing import Optional
-import os
-import types
-import torch
-import logging
+# from typing import Optional
+# import os
+# import types
+# import torch
+# import logging
 
-from tensordict.tensorclass import NonTensorData
-from torch.utils.data import DistributedSampler
-from torchdata.stateful_dataloader import StatefulDataLoader
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+# from tensordict.tensorclass import NonTensorData
+# from torch.utils.data import DistributedSampler
+# from torchdata.stateful_dataloader import StatefulDataLoader
+# from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+# from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
 
-from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint import CheckpointHandler
-from verl.utils.dataset.dataset_utils import DatasetPadMode
-from verl.utils.device import get_device_name, get_device_id
-from verl.utils.logger import log_with_rank
-from verl.utils.tracking import Tracking
-from verl.workers.engine_workers import TrainingWorker
-from verl.workers.engine_workers.fsdp_engine import FSDPEngineWithLMHead
-from verl.utils.distributed import destroy_global_process_group
+# from verl.utils import tensordict_utils as tu
+# from verl.utils.checkpoint import CheckpointHandler
+# from verl.utils.dataset.dataset_utils import DatasetPadMode
+# from verl.utils.device import get_device_name, get_device_id
+# from verl.utils.logger import log_with_rank
+# from verl.utils.tracking import Tracking
+# from verl.workers.engine_workers import TrainingWorker
+# from verl.workers.engine_workers.fsdp_engine import FSDPEngineWithLMHead
+# from verl.utils.distributed import destroy_global_process_group
 
-logger = logging.getLogger(__file__)
+# logger = logging.getLogger(__file__)
 
 
-@EngineRegistry.register(
-    model_type="language_model_with_speculator",
-    backend=["fsdp", "fsdp2"],
-    device=["cuda", "npu"],
-)
-class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
-    """
-    Engine that trains a base LM *and a speculator* following Arctic-style speculative decoding training.
-    """
+# @EngineRegistry.register(
+#     model_type="language_model_with_speculator",
+#     backend=["fsdp", "fsdp2"],
+#     device=["cuda", "npu"],
+# )
+# class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
+#     """
+#     Engine that trains a base LM *and a speculator* following Arctic-style speculative decoding training.
+#     """
 
-    def __init__(
-        self,
-        model_config,
-        engine_config,
-        optimizer_config,
-        checkpoint_config,
-    ):
-        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+#     def __init__(
+#         self,
+#         model_config,
+#         engine_config,
+#         optimizer_config,
+#         checkpoint_config,
+#     ):
+#         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
-        # Load speculator config if any
-        self.speculator_config = getattr(model_config, "speculator", None)
-        self.speculator = None
-        self.speculator_helper = None
+#         # Load speculator config if any
+#         self.speculator_config = getattr(model_config, "speculator", None)
+#         self.speculator = None
+#         self.speculator_helper = None
 
-    def _build_module(self):
-        # Build base module
-        module = super()._build_module()
+#     def _build_module(self):
+#         # Build base module
+#         module = super()._build_module()
 
-        # If there's a speculator block defined
-        if self.speculator_config is not None:
-            from verl.trainer.speculator_helper import SpeculatorHelper
+#         # If there's a speculator block defined
+#         if self.speculator_config is not None:
+#             from verl.trainer.speculator_helper import SpeculatorHelper
 
-            module_dtype = next(module.parameters()).dtype
-            self.speculator_helper = SpeculatorHelper(
-                config=None,
-                model_config=self.model_config,
-                device_name=get_device_name(),
-                device_mesh=self.device_mesh,
-                torch_dtype=module_dtype,
-                speculator_config=self.speculator_config,
-                freeze_base_model=True,
-            )
-            self.speculator = self.speculator_helper.build_and_attach(module)
+#             module_dtype = next(module.parameters()).dtype
+#             self.speculator_helper = SpeculatorHelper(
+#                 config=None,
+#                 model_config=self.model_config,
+#                 device_name=get_device_name(),
+#                 device_mesh=self.device_mesh,
+#                 torch_dtype=module_dtype,
+#                 speculator_config=self.speculator_config,
+#                 freeze_base_model=True,
+#             )
+#             self.speculator = self.speculator_helper.build_and_attach(module)
 
-        return module
+#         return module
 
-    def prepare_model_inputs(self, micro_batch):
-        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
-        # Always ask for hidden states so we can feed to speculator
-        model_inputs["output_hidden_states"] = True
-        return model_inputs, output_args
+#     def prepare_model_inputs(self, micro_batch):
+#         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+#         # Always ask for hidden states so we can feed to speculator
+#         model_inputs["output_hidden_states"] = True
+#         return model_inputs, output_args
 
-    def forward_step(self, micro_batch, loss_function, forward_only):
-        """Forward and backward logic with speculator training."""
+#     def forward_step(self, micro_batch, loss_function, forward_only):
+#         """Forward and backward logic with speculator training."""
 
-        # If no speculator or forward_only (inference) -> fallback
-        if self.speculator is None or forward_only:
-            return super().forward_step(micro_batch, loss_function, forward_only)
+#         # If no speculator or forward_only (inference) -> fallback
+#         if self.speculator is None or forward_only:
+#             return super().forward_step(micro_batch, loss_function, forward_only)
 
-        # micro_batch to correct device
-        micro_batch = micro_batch.to(get_device_id())
-        # Base model forward to get hidden states (no grad)
-        model_inputs, output_args = self.prepare_model_inputs(micro_batch)
+#         # micro_batch to correct device
+#         micro_batch = micro_batch.to(get_device_id())
+#         # Base model forward to get hidden states (no grad)
+#         model_inputs, output_args = self.prepare_model_inputs(micro_batch)
 
-        with torch.no_grad():
-            base_out = self.module(
-                **model_inputs,
-                use_cache=False,
-                output_hidden_states=True,
-            )
-            # Last hidden layer from base LM
-            hidden_states = base_out.hidden_states[-1]
+#         with torch.no_grad():
+#             base_out = self.module(
+#                 **model_inputs,
+#                 use_cache=False,
+#                 output_hidden_states=True,
+#             )
+#             # Last hidden layer from base LM
+#             hidden_states = base_out.hidden_states[-1]
 
-        # Get tokens & masks
-        input_ids = micro_batch["input_ids"]
-        loss_mask = micro_batch["loss_mask"]
-        # Only support dense padded sequences
-        use_remove_padding = tu.get_non_tensor_data(
-            data=micro_batch, key="use_remove_padding", default=False
-        )
-        if use_remove_padding:
-            raise NotImplementedError("remove_padding not supported for speculator training")
+#         # Get tokens & masks
+#         input_ids = micro_batch["input_ids"]
+#         loss_mask = micro_batch["loss_mask"]
+#         # Only support dense padded sequences
+#         use_remove_padding = tu.get_non_tensor_data(
+#             data=micro_batch, key="use_remove_padding", default=False
+#         )
+#         if use_remove_padding:
+#             raise NotImplementedError("remove_padding not supported for speculator training")
 
-        spec_logits = self.speculator_helper.compute_speculator_logits(
-            self.module,
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-        )
-        spec_loss = self.speculator_helper.compute_speculator_loss(
-            self.module,
-            input_ids=input_ids,
-            loss_mask=loss_mask,
-            hidden_states=hidden_states,
-            spec_logits=spec_logits,
-        )
-        total_loss = spec_loss
+#         spec_logits = self.speculator_helper.compute_speculator_logits(
+#             self.module,
+#             input_ids=input_ids,
+#             hidden_states=hidden_states,
+#         )
+#         spec_loss = self.speculator_helper.compute_speculator_loss(
+#             self.module,
+#             input_ids=input_ids,
+#             loss_mask=loss_mask,
+#             hidden_states=hidden_states,
+#             spec_logits=spec_logits,
+#         )
+#         total_loss = spec_loss
 
-        # Optionally combine with base loss
-        if loss_function is not None:
-            # Call parent's loss function only for metrics (or base training if desired)
-            base_loss, base_metrics = loss_function(
-                model_output=super().prepare_model_outputs(
-                    output=base_out, output_args=output_args, micro_batch=micro_batch
-                ),
-                data=micro_batch,
-                dp_group=self.get_data_parallel_group(),
-            )
-            metrics = base_metrics
-        else:
-            metrics = {}
+#         # Optionally combine with base loss
+#         if loss_function is not None:
+#             # Call parent's loss function only for metrics (or base training if desired)
+#             base_loss, base_metrics = loss_function(
+#                 model_output=super().prepare_model_outputs(
+#                     output=base_out, output_args=output_args, micro_batch=micro_batch
+#                 ),
+#                 data=micro_batch,
+#                 dp_group=self.get_data_parallel_group(),
+#             )
+#             metrics = base_metrics
+#         else:
+#             metrics = {}
 
-        # Add speculator metric
-        metrics["train/speculator_loss"] = spec_loss.detach().item()
+#         # Add speculator metric
+#         metrics["train/speculator_loss"] = spec_loss.detach().item()
 
-        output = {
-            "model_output": {"spec_logits": spec_logits},
-            "loss": total_loss.detach().item(),
-            "metrics": metrics,
-        }
-        return total_loss, output
+#         output = {
+#             "model_output": {"spec_logits": spec_logits},
+#             "loss": total_loss.detach().item(),
+#             "metrics": metrics,
+#         }
+#         return total_loss, output
 
-    def save_checkpoint(
-        self,
-        local_path: str,
-        hdfs_path: Optional[str] = None,
-        global_step: int = 0,
-        max_ckpt_to_keep: Optional[int] = None,
-        **kwargs,
-    ):
+#     def save_checkpoint(
+#         self,
+#         local_path: str,
+#         hdfs_path: Optional[str] = None,
+#         global_step: int = 0,
+#         max_ckpt_to_keep: Optional[int] = None,
+#         **kwargs,
+#     ):
 
-        # Save base model first
-        super().save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
+#         # Save base model first
+#         super().save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
 
-        if self.speculator is None or self.speculator_helper is None:
-            logger.warning("No speculator, skipping save.")
-            return
+#         if self.speculator is None or self.speculator_helper is None:
+#             logger.warning("No speculator, skipping save.")
+#             return
 
-        self.speculator_helper.save_checkpoint(self.module, local_path)
+#         self.speculator_helper.save_checkpoint(self.module, local_path)
 
-        torch.distributed.barrier()
+#         torch.distributed.barrier()

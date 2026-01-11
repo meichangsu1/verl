@@ -1,43 +1,96 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# The model definition was built on-top of the model defined in:
+# https://github.com/foundation-model-stack/fms-extras/blob/c5c294defa01459ff435e8ff6132c707eff9d22b/fms_extras/models/speculator.py.
+# Modifications have been made by Snowflake.
 
 import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+# from .configs import MLPSpeculatorConfig
+from dataclasses import make_dataclass
 
 
 class LayerNormParameterized(nn.Module):
-    """LayerNorm with elementwise shift and scale parameters."""
+    """
+    A generalized LayerNorm implementation. With all optional arguments set to True, equivalent to nn.LayerNorm up to epsilon stabilization term
+    (this class divides inputs by min(norm, eps), while nn.LayerNorm divides by norm + eps).
+    ...
+    Args
+    ----
+    normalized_shape : int
+        Dimensionality of input data (size of final tensor axis)
+    eps : float
+        Safety term to prevent division by zero. Make sure the chosen value fits in the range of your encoding scheme (i.e. fp16 requires eps >= 6e-8).
+    elementwise_scale : bool
+        Include a learned scaling term after normalization?
+    elementwise_shift : bool
+        Include a learned bias term after normalization?
+    use_mean : bool
+        Recenter inputs around zero before normalizing, or just rescale?
+    """
 
-    def __init__(self, normalized_shape, elementwise_shift=True, elementwise_scale=True, eps=1e-5):
-        super().__init__()
+    def __init__(
+        self,
+        normalized_shape,
+        eps=1e-06,
+        elementwise_scale=True,
+        elementwise_shift=False,
+        use_mean=False,
+        use_high_precision_pow=False,
+    ):
+        super(LayerNormParameterized, self).__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.elementwise_shift = elementwise_shift
         self.elementwise_scale = elementwise_scale
-        if self.elementwise_shift:
-            self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        else:
-            self.register_buffer("bias", None)
+        self.elementwise_shift = elementwise_shift
+        self.use_mean = use_mean
+        self.use_high_precision_pow = use_high_precision_pow
+
         if self.elementwise_scale:
-            self.weight = nn.Parameter(torch.ones(normalized_shape))
-        else:
-            self.register_buffer("weight", None)
+            self.weight = nn.Parameter(torch.empty(self.normalized_shape))
+        # else:
+        #     self.register_parameter("weight", None)
+        if self.elementwise_shift:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        # else:
+        #     self.register_parameter("bias", None)
+
+    def reset_parameters(self):
+        if self.elementwise_scale:
+            self.weight.data.fill_(1)
+        if self.elementwise_shift:
+            self.bias.data.zero_()
 
     def forward(self, x):
-        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        if self.use_mean:
+            x = x - x.mean(-1, keepdim=True)
+        # x = F.normalize(x, dim=-1)*math.sqrt(x.size(-1))
+        xf = x
+        if self.use_high_precision_pow:
+            xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = xf.type_as(x)
+        if self.elementwise_scale:
+            x = self.weight * x
+        if self.elementwise_shift:
+            x = x + self.bias
+        return x
 
 
 class ArcticLSTMSpeculator(nn.Module):
@@ -300,21 +353,18 @@ def create_speculator_from_config(speculator_config: dict):
     """
     Create an ArcticLSTMSpeculator instance from a configuration dictionary.
     """
-    from dataclasses import make_dataclass
-
-    # Define a simple config class with required fields
     fields = [
-        ('n_predict', int),
-        ('input_hidden_dim', int),
-        ('inner_dim', str),
-        ('emb_dim', str),
-        ('proj_dim', str),
-        ('vocab_size', int),
-        ('scale_input', bool),
-        ('tie_weights', bool),
-        ('tie_lstm_embs', bool),
-        ('method', str),
+        ("n_predict", int),
+        ("input_hidden_dim", int),
+        ("inner_dim", str),
+        ("emb_dim", str),
+        ("proj_dim", str),
+        ("vocab_size", int),
+        ("scale_input", bool),
+        ("tie_weights", bool),
+        ("tie_lstm_embs", bool),
+        ("method", str),
     ]
-    ConfigClass = make_dataclass('SpeculatorConfig', fields)
+    ConfigClass = make_dataclass("SpeculatorConfig", fields)
     config = ConfigClass(**speculator_config)
     return ArcticLSTMSpeculator(config)
