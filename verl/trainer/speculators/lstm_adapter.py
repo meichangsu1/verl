@@ -124,7 +124,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
             "method": self.speculator_config.get("method", "sum_lstm"),
         }
 
-        from verl.models.transformers import speculator as speculator_mod
+        from verl.models.speculator import speculator as speculator_mod
 
         if hasattr(speculator_mod, "create_speculator_from_config"):
             self.speculator = speculator_mod.create_speculator_from_config(speculator_config_dict)
@@ -393,7 +393,10 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 state_dict = torch.load(state_dict_path, map_location="cpu")
             else:
                 state_dict = {}
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            try:
+                from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            except Exception:
+                from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
             options = StateDictOptions(
                 full_state_dict=True,
@@ -401,7 +404,11 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 broadcast_from_rank0=True,
                 strict=False,
             )
-            set_model_state_dict(fsdp_model, model_state_dict=state_dict, options=options)
+            set_model_state_dict(
+                fsdp_model,
+                model_state_dict={speculator_module: state_dict},
+                options=options,
+            )
         else:
             state_dict = torch.load(state_dict_path, map_location="cpu")
             speculator_module.load_state_dict(state_dict)

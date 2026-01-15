@@ -281,10 +281,9 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         if speculator_module is None:
             return
 
-        state_dict = torch.load(state_dict_path, map_location="cpu")
-
         fsdp_ver = fsdp_version(fsdp_model)
         if fsdp_ver == 1:
+            state_dict = torch.load(state_dict_path, map_location="cpu")
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
 
@@ -304,8 +303,25 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
                 with FSDP.summon_full_params(speculator_module, writeback=True):
                     speculator_module.load_state_dict(state_dict)
         elif fsdp_ver == 2:
-            speculator_module.load_state_dict(state_dict)
+            state_dict = torch.load(state_dict_path, map_location="cpu") if dist.get_rank() == 0 else {}
+            try:
+                from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+            except Exception:
+                from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+            options = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=False,
+                broadcast_from_rank0=True,
+                strict=False,
+            )
+            set_model_state_dict(
+                fsdp_model,
+                model_state_dict={speculator_module: state_dict},
+                options=options,
+            )
         else:
+            state_dict = torch.load(state_dict_path, map_location="cpu")
             speculator_module.load_state_dict(state_dict)
 
         if dist.get_rank() == 0:
