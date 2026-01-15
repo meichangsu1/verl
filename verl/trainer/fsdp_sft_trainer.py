@@ -410,17 +410,9 @@ class FSDPSFTTrainer:
         """
 
         # clean device move
-        """
-        Compute base loss + speculator loss if applicable.
-        This version cleanly separates loss components.
-        """
-
-        # clean device move
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
-
         loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
@@ -435,46 +427,7 @@ class FSDPSFTTrainer:
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=False
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            # ========== BASE LM LOSS ==========
-            base_loss = torch.tensor(0.0, device=self.device_name)
-            if not self.has_speculator or not self.freeze_base_model:
-                # compute base forward
-                base_out = self.fsdp_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    use_cache=False
                 )
-                logits = base_out.logits[..., :-1, :]
-                labels = input_ids[:, 1:].contiguous()
-
-                flat_logits = logits.reshape(-1, logits.size(-1))
-                flat_labels = labels.reshape(-1)
-
-                ce = loss_fct(flat_logits, flat_labels)
-                ce = ce * loss_mask  # mask paddings
-                base_loss = ce.sum() / loss_mask.sum().clamp(min=1)
-
-            # ========== SPECULATOR LOSS ==========
-            spec_loss = torch.tensor(0.0, device=self.device_name)
-            if self.has_speculator:
-                spec_loss = self.speculator_adapter.compute_speculator_loss(
-                    self.fsdp_model,
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    loss_mask,
-                )
-
-            # ========== TOTAL ==========
-            total_loss = base_loss + spec_loss
-
-        # backward
-        if do_backward:
-            total_loss.backward()
-
-        return total_loss
                 logits = base_out.logits[..., :-1, :]
                 labels = input_ids[:, 1:].contiguous()
 
