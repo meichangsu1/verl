@@ -285,6 +285,8 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         if DTensor is not None and isinstance(seq_ids, DTensor):
             pad_ids = DTensor.from_local(pad_ids, seq_ids.device_mesh, placements=seq_ids.placements)
         spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
+        if DTensor is not None and isinstance(first_param, DTensor) and not isinstance(spec_inds, DTensor):
+            spec_inds = DTensor.from_local(spec_inds, first_param.device_mesh, placements=first_param.placements)
 
         spec_logits = speculator_module(hidden, spec_inds)
         return spec_logits
