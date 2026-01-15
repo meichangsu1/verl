@@ -1174,7 +1174,6 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
             base_out = self.module(
                 **model_inputs,
                 use_cache=False,
-                output_hidden_states=True,
             )
             model_output = self.prepare_model_outputs(
                 output=base_out, output_args=output_args, micro_batch=micro_batch

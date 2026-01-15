@@ -16,6 +16,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.train_files=/model/ljl/arctic-traing-datasets/data/train.parquet \
     data.val_files=/model/ljl/arctic-traing-datasets/data/test.parquet \
     data.micro_batch_size_per_gpu=1 \
+    ++data.ignore_input_ids_mismatch=true \
+    ++data.enable_thinking_key=null \
     model.path=/model/ljl/Qwen3MoeCustom3 \
     model.use_remove_padding=false \
     model.freeze_base_model=true \
