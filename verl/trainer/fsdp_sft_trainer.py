@@ -362,11 +362,17 @@ class FSDPSFTTrainer:
                 "offload_policy": cpu_offload,
                 "reshard_after_forward": True,
             }
+            speculator_module = None
+            if hasattr(self.model, "speculator"):
+                speculator_module = self.model.speculator
+                delattr(self.model, "speculator")
+
             full_state = self.model.state_dict()
-            if self.speculator_adapter is not None and self.speculator_adapter.has_speculator:
-                full_state = {k: v for k, v in full_state.items() if not k.startswith("speculator.")}
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
+            if speculator_module is not None:
+                self.model.speculator = speculator_module
+                self.model.speculator.to(get_device_name())
             self.fsdp_model = self.model
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
