@@ -319,6 +319,23 @@ class ArcticLSTMSpeculator(nn.Module):
             return value
 
         if self.method == "sum_lstm":
+            try:
+                ref_weight = self.forget_emb[0].weight
+            except Exception:
+                ref_weight = None
+        else:
+            try:
+                ref_weight = self.emb[0].weight
+            except Exception:
+                ref_weight = None
+
+        if DTensor is not None and ref_weight is not None:
+            if isinstance(ref_weight, DTensor) and not isinstance(inds, DTensor):
+                inds = DTensor.from_local(inds, ref_weight.device_mesh, placements=ref_weight.placements)
+            elif not isinstance(ref_weight, DTensor) and isinstance(inds, DTensor):
+                inds = inds.to_local()
+
+        if self.method == "sum_lstm":
             cell_state = torch.zeros(state_shapes, device=state.device, dtype=state.dtype)
             for i in range(self.n_predict):
                 prev_state = state
