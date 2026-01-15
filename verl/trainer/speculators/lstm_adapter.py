@@ -182,6 +182,16 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
+        # NestedTensor does not support slicing on dim=0, so materialize padded tensors here.
+        def _maybe_pad_nested(tensor, padding):
+            if isinstance(tensor, torch.Tensor) and tensor.is_nested:
+                return torch.nested.to_padded_tensor(tensor, padding=padding)
+            return tensor
+
+        input_ids = _maybe_pad_nested(input_ids, padding=0)
+        if loss_mask is not None:
+            loss_mask = _maybe_pad_nested(loss_mask, padding=0)
+
         if hidden_states is None:
             with torch.no_grad():
                 hidden_out = fsdp_model(
@@ -193,7 +203,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 )
                 hidden = hidden_out.hidden_states[-1]
         else:
-            hidden = hidden_states
+            hidden = _maybe_pad_nested(hidden_states, padding=0.0)
         if spec_logits is None:
             spec_logits = self.compute_speculator_logits(fsdp_model, input_ids, hidden)
 
@@ -229,6 +239,12 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         speculator_module = self._get_speculator_module(fsdp_model)
         if speculator_module is None:
             return None
+
+        # Speculator assumes regular tensors for slicing and indexing.
+        if isinstance(input_ids, torch.Tensor) and input_ids.is_nested:
+            input_ids = torch.nested.to_padded_tensor(input_ids, padding=0)
+        if isinstance(hidden_states, torch.Tensor) and hidden_states.is_nested:
+            hidden_states = torch.nested.to_padded_tensor(hidden_states, padding=0.0)
 
         try:
             first_param = speculator_module.forget_emb[0].weight
