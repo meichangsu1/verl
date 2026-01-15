@@ -181,23 +181,41 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         if speculator_module is None:
             return None
 
-        if hasattr(hidden_states, "to_local"):
-            try:
-                from torch.distributed.tensor import DTensor
+        try:
+            first_param = next(speculator_module.parameters())
+        except StopIteration:
+            first_param = None
 
-                if isinstance(hidden_states, DTensor):
+        try:
+            from torch.distributed.tensor import DTensor, Replicate
+        except Exception:
+            DTensor = None
+            Replicate = None
+
+        if DTensor is not None and isinstance(first_param, DTensor):
+            placements = [Replicate() for _ in range(self.device_mesh.ndim)]
+
+            def _to_dtensor(x):
+                if isinstance(x, DTensor):
+                    return x
+                return DTensor.from_local(x, self.device_mesh, placements=placements)
+
+            hidden_states = _to_dtensor(hidden_states)
+            input_ids = _to_dtensor(input_ids)
+        else:
+            if hasattr(hidden_states, "to_local"):
+                try:
+                    if DTensor is not None and isinstance(hidden_states, DTensor):
+                        hidden_states = hidden_states.to_local()
+                except Exception:
                     hidden_states = hidden_states.to_local()
-            except Exception:
-                hidden_states = hidden_states.to_local()
 
-        if hasattr(input_ids, "to_local"):
-            try:
-                from torch.distributed.tensor import DTensor
-
-                if isinstance(input_ids, DTensor):
+            if hasattr(input_ids, "to_local"):
+                try:
+                    if DTensor is not None and isinstance(input_ids, DTensor):
+                        input_ids = input_ids.to_local()
+                except Exception:
                     input_ids = input_ids.to_local()
-            except Exception:
-                input_ids = input_ids.to_local()
 
         n_predict = speculator_module.n_predict
         hidden = hidden_states[:, : -(n_predict + 1), :]
