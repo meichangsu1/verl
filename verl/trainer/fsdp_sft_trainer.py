@@ -306,15 +306,6 @@ class FSDPSFTTrainer:
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        # Build and attach speculator before FSDP wrapping to ensure it is sharded.
-        if self.speculator_adapter is not None:
-            self.speculator = self.speculator_adapter.build_and_attach(
-                self.model,
-                attach_to_model=True,
-            )
-        else:
-            self.speculator = None
-
         log_gpu_memory_usage("After model allocation", logger=logger)
 
         mixed_precision = MixedPrecision(
@@ -362,22 +353,23 @@ class FSDPSFTTrainer:
                 "offload_policy": cpu_offload,
                 "reshard_after_forward": True,
             }
-            speculator_module = None
-            if hasattr(self.model, "speculator"):
-                speculator_module = self.model.speculator
-                delattr(self.model, "speculator")
-
             full_state = self.model.state_dict()
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
-            if speculator_module is not None:
-                self.model.speculator = speculator_module
-                self.model.speculator.to(get_device_name())
             self.fsdp_model = self.model
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
+
+        # Build and attach speculator after FSDP wrapping to avoid DTensor conversion.
+        if self.speculator_adapter is not None:
+            self.speculator = self.speculator_adapter.build_and_attach(
+                self.fsdp_model,
+                attach_to_model=True,
+            )
+        else:
+            self.speculator = None
 
         optimizer_params = (
             self.speculator_adapter.get_optimizer_params(self.fsdp_model)

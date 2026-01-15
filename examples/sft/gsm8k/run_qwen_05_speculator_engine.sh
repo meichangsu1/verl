@@ -13,21 +13,17 @@ shift 2
 
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     -m verl.trainer.sft_trainer \
-    data.train_files=/model/ljl/arctic-traing-datasets/data/gsm8k/train.parquet \
-    data.val_files=/model/ljl/arctic-traing-datasets/data/gsm8k/test.parquet \
-    data.prompt_key=extra_info \
-    data.response_key=extra_info \
-    data.prompt_dict_keys=['question'] \
-    +data.response_dict_keys=['answer'] \
+    data.train_files=/model/ljl/arctic-traing-datasets/data/train.parquet \
+    data.val_files=/model/ljl/arctic-traing-datasets/data/test.parquet \
     data.micro_batch_size_per_gpu=1 \
     model.path=/model/ljl/Qwen3MoeCustom3 \
     model.use_remove_padding=false \
     model.freeze_base_model=true \
-    +model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
-    +model.speculator.n_predict=3 \
-    +model.speculator.method=sum_lstm \
-    +model.speculator.tie_lstm_embs=true \
-    +model.speculator.tie_weights=true \
+    ++model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
+    ++model.speculator.n_predict=3 \
+    ++model.speculator.method=sum_lstm \
+    ++model.speculator.tie_lstm_embs=true \
+    ++model.speculator.tie_weights=true \
     engine.strategy=fsdp2 \
     trainer.default_local_dir=$save_path \
     trainer.project_name=gsm8k-sft \

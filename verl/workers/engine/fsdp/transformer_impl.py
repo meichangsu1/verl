@@ -1100,9 +1100,42 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
                 device_mesh=self.device_mesh,
                 torch_dtype=module_dtype,
             )
-            self.speculator = self.speculator_adapter.build_and_attach(module)
+            # Defer speculator attachment until after FSDP wrapping.
 
         return module
+
+    def _build_model_optimizer(self):
+        from verl.utils.model import print_model_size
+
+        module = self._build_module()
+        if self._is_lora:
+            module = self._build_lora_module(module)
+
+        torch.distributed.barrier()
+        if self.rank == 0:
+            print_model_size(module)
+        log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+
+        log_gpu_memory_usage("Before FSDP", logger=None)
+        module = self._build_fsdp_module(module)
+        log_gpu_memory_usage("After FSDP", logger=None)
+
+        # Attach speculator after FSDP wrapping to avoid DTensor conversion.
+        if self.speculator_adapter is not None:
+            self.speculator = self.speculator_adapter.build_and_attach(module)
+        else:
+            self.speculator = None
+
+        if not self.engine_config.forward_only:
+            optimizer = self._build_optimizer(module)
+            lr_scheduler = self._build_lr_scheduler(optimizer)
+        else:
+            optimizer = None
+            lr_scheduler = None
+
+        self.module = module
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
 
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
