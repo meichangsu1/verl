@@ -242,12 +242,13 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
             Replicate = None
 
         if DTensor is not None and isinstance(first_param, DTensor):
-            placements = [Replicate() for _ in range(self.device_mesh.ndim)]
+            mesh = first_param.device_mesh
+            placements = first_param.placements
 
             def _to_dtensor(x):
                 if isinstance(x, DTensor):
                     return x
-                return DTensor.from_local(x, self.device_mesh, placements=placements)
+                return DTensor.from_local(x, mesh, placements=placements)
 
             hidden_states = _to_dtensor(hidden_states)
             input_ids = _to_dtensor(input_ids)
@@ -281,6 +282,8 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         hidden = hidden_states[:, : -(n_predict + 1), :]
         seq_ids = input_ids[:, 1:]
         pad_ids = torch.zeros(input_ids.size(0), n_predict, dtype=seq_ids.dtype, device=seq_ids.device)
+        if DTensor is not None and isinstance(seq_ids, DTensor):
+            pad_ids = DTensor.from_local(pad_ids, seq_ids.device_mesh, placements=seq_ids.placements)
         spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
 
         spec_logits = speculator_module(hidden, spec_inds)
