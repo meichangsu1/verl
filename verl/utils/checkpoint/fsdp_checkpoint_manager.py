@@ -135,7 +135,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
-                self.model.load_state_dict(model_state_dict)
+                target_model = getattr(self.model, "_fsdp_wrapped_module", self.model)
+                strict = not hasattr(target_model, "speculator")
+                self.model.load_state_dict(model_state_dict, strict=strict)
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:

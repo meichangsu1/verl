@@ -16,6 +16,7 @@ Create a simple multi-turn dataset for testing
 """
 
 import argparse
+import copy
 import os
 
 import pandas as pd
@@ -25,13 +26,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default="~/data/multiturn")
     parser.add_argument("--hdfs_dir", default=None)
+    parser.add_argument("--num_conversations", type=int, default=100)
+    parser.add_argument("--train_ratio", type=float, default=0.9)
     args = parser.parse_args()
 
     # Create example conversations
-    conversations = []
+    base_conversations = []
 
     # Conversation 1
-    conversations.append(
+    base_conversations.append(
         {
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -44,7 +47,7 @@ def main():
     )
 
     # Conversation 2
-    conversations.append(
+    base_conversations.append(
         {
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -65,7 +68,7 @@ def main():
     )
 
     # Conversation 3
-    conversations.append(
+    base_conversations.append(
         {
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -90,9 +93,32 @@ def main():
         }
     )
 
+    def clone_conversation(conversation, idx):
+        cloned = copy.deepcopy(conversation)
+        for msg in cloned["messages"]:
+            if msg["role"] == "user":
+                msg["content"] = f"{msg['content']} (example {idx})"
+                break
+        return cloned
+
+    # Create a larger dataset by cycling base conversations.
+    if args.num_conversations < 1:
+        raise ValueError("num_conversations must be >= 1")
+
+    conversations = [
+        clone_conversation(base_conversations[i % len(base_conversations)], i)
+        for i in range(args.num_conversations)
+    ]
+
     # Create train and test datasets
-    train_data = conversations[:2]  # First 2 conversations for training
-    test_data = conversations[2:]  # Last conversation for testing
+    if len(conversations) == 1:
+        train_data = conversations
+        test_data = []
+    else:
+        train_size = int(len(conversations) * args.train_ratio)
+        train_size = max(1, min(train_size, len(conversations) - 1))
+        train_data = conversations[:train_size]
+        test_data = conversations[train_size:]
 
     # Create output directory
     local_dir = os.path.expanduser(args.local_dir)
