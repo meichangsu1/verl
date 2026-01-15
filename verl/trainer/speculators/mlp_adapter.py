@@ -182,9 +182,12 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
             return None
 
         try:
-            first_param = next(speculator_module.parameters())
-        except StopIteration:
-            first_param = None
+            first_param = speculator_module.emb[0].weight
+        except Exception:
+            try:
+                first_param = next(speculator_module.parameters())
+            except StopIteration:
+                first_param = None
 
         try:
             from torch.distributed.tensor import DTensor, Replicate
