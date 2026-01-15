@@ -305,6 +305,8 @@ class ArcticLSTMSpeculator(nn.Module):
                 return idx_slice
             if isinstance(emb_weight, DTensor) and not isinstance(idx_slice, DTensor):
                 return DTensor.from_local(idx_slice, emb_weight.device_mesh, placements=emb_weight.placements)
+            if not isinstance(emb_weight, DTensor) and isinstance(idx_slice, DTensor):
+                return idx_slice.to_local()
             return idx_slice
 
         def _maybe_to_dtensor_like(weight, value):
@@ -312,6 +314,8 @@ class ArcticLSTMSpeculator(nn.Module):
                 return value
             if isinstance(weight, DTensor) and not isinstance(value, DTensor):
                 return DTensor.from_local(value, weight.device_mesh, placements=weight.placements)
+            if not isinstance(weight, DTensor) and isinstance(value, DTensor):
+                return value.to_local()
             return value
 
         if self.method == "sum_lstm":
