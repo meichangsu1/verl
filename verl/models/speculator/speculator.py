@@ -295,46 +295,6 @@ class ArcticLSTMSpeculator(nn.Module):
 
         state_shapes = list(state.shape)
         state_shapes[-1] = self.inner_dim[-1]
-        try:
-            from torch.distributed.tensor import DTensor
-        except Exception:
-            DTensor = None
-
-        def _maybe_to_dtensor(emb_weight, idx_slice):
-            if DTensor is None:
-                return idx_slice
-            if isinstance(emb_weight, DTensor) and not isinstance(idx_slice, DTensor):
-                return DTensor.from_local(idx_slice, emb_weight.device_mesh, placements=emb_weight.placements)
-            if not isinstance(emb_weight, DTensor) and isinstance(idx_slice, DTensor):
-                return idx_slice.to_local()
-            return idx_slice
-
-        def _maybe_to_dtensor_like(weight, value):
-            if DTensor is None:
-                return value
-            if isinstance(weight, DTensor) and not isinstance(value, DTensor):
-                return DTensor.from_local(value, weight.device_mesh, placements=weight.placements)
-            if not isinstance(weight, DTensor) and isinstance(value, DTensor):
-                return value.to_local()
-            return value
-
-        if self.method == "sum_lstm":
-            try:
-                ref_weight = self.forget_emb[0].weight
-            except Exception:
-                ref_weight = None
-        else:
-            try:
-                ref_weight = self.emb[0].weight
-            except Exception:
-                ref_weight = None
-
-        if DTensor is not None and ref_weight is not None:
-            if isinstance(ref_weight, DTensor) and not isinstance(inds, DTensor):
-                inds = DTensor.from_local(inds, ref_weight.device_mesh, placements=ref_weight.placements)
-            elif not isinstance(ref_weight, DTensor) and isinstance(inds, DTensor):
-                inds = inds.to_local()
-
         if self.method == "sum_lstm":
             cell_state = torch.zeros(state_shapes, device=state.device, dtype=state.dtype)
             for i in range(self.n_predict):
@@ -342,29 +302,21 @@ class ArcticLSTMSpeculator(nn.Module):
                 actual_i = 0 if self.tie_weights else i
                 actual_proj_i = 1 if self.tie_weights and i >= 2 else i
 
-                idx_slice = _maybe_to_dtensor(self.forget_emb[actual_i].weight, inds[:, i : i + state.size(1)])
-                z = self.forget_emb[actual_i](idx_slice)  # b n d
-                prev_state = _maybe_to_dtensor_like(self.forget_proj[actual_proj_i].weight, prev_state)
+                z = self.forget_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.forget_proj[actual_proj_i](prev_state)
                 forget_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
 
-                idx_slice = _maybe_to_dtensor(self.input_emb[actual_i].weight, inds[:, i : i + state.size(1)])
-                z = self.input_emb[actual_i](idx_slice)  # b n d
-                prev_state = _maybe_to_dtensor_like(self.input_proj[actual_proj_i].weight, prev_state)
+                z = self.input_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.input_proj[actual_proj_i](prev_state)
                 input_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
 
-                idx_slice = _maybe_to_dtensor(self.cell_emb[actual_i].weight, inds[:, i : i + state.size(1)])
-                z = self.cell_emb[actual_i](idx_slice)  # b n d
-                prev_state = _maybe_to_dtensor_like(self.cell_proj[actual_proj_i].weight, prev_state)
+                z = self.cell_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.cell_proj[actual_proj_i](prev_state)
                 cell_candidate = torch.add(state, z, alpha=self.emb_weight / self.state_weight)
                 cell_candidate = self.activation(self.cell_ln[actual_i](cell_candidate))  # b n d
                 cell_candidate = cell_candidate * input_gate
 
-                idx_slice = _maybe_to_dtensor(self.output_emb[actual_i].weight, inds[:, i : i + state.size(1)])
-                z = self.output_emb[actual_i](idx_slice)  # b n d
-                prev_state = _maybe_to_dtensor_like(self.output_proj[actual_proj_i].weight, prev_state)
+                z = self.output_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.output_proj[actual_proj_i](prev_state)
                 output_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
 
@@ -385,9 +337,7 @@ class ArcticLSTMSpeculator(nn.Module):
                 actual_i = 0 if self.tie_weights else i
                 actual_proj_i = 1 if self.tie_weights and i >= 2 else i
 
-                idx_slice = _maybe_to_dtensor(self.emb[actual_i].weight, inds[:, i : i + state.size(1)])
-                z = self.emb[actual_i](idx_slice)  # b n d
-                state = _maybe_to_dtensor_like(self.proj[actual_proj_i].weight, state)
+                z = self.emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.proj[actual_proj_i](state)
                 # Weighted add of state_weight*state and emb_weight*z
                 # Let subsequent LN take care of denominator
