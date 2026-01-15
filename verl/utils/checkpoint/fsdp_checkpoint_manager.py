@@ -236,6 +236,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                 if self.should_save_model:
                     model_state_dict = self.model.state_dict()
+                    # Speculator weights are saved separately via adapter, skip them here.
+                    if any(k.startswith("speculator.") for k in model_state_dict.keys()):
+                        model_state_dict = {k: v for k, v in model_state_dict.items() if not k.startswith("speculator.")}
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
