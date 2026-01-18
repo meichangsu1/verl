@@ -171,9 +171,8 @@ class SpeculatorManager:
             self.device_mesh,
             self.torch_dtype,
         )
-    
 
-     def build_speculator(self, model, fsdp_strategy, fsdp_kwargs):
+    def build_speculator(self, model, fsdp_strategy, fsdp_kwargs):
         assert model is not None, "model must be provided to build speculator"
         if fsdp_strategy == "fsdp":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
