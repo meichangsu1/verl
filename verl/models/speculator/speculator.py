@@ -302,8 +302,10 @@ class ArcticLSTMSpeculator(nn.Module):
                 actual_i = 0 if self.tie_weights else i
                 actual_proj_i = 1 if self.tie_weights and i >= 2 else i
 
-                inds_index = torch.arange(i, i + state.size(1), device=inds.device)
-                inds_slice = inds.index_select(1, inds_index)
+                # inds_index = torch.arange(i, i + state.size(1), device=inds.device)
+           
+                # inds_slice = inds.index_select(1, inds_index)
+                inds_slice=inds[:, i : i + state.size(1)]
                 z = self.forget_emb[actual_i](inds_slice)  # b n d
                 state = self.forget_proj[actual_proj_i](prev_state)
                 forget_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
