@@ -173,23 +173,23 @@ class SpeculatorManager:
         )
     
 
-    def build_speculator(self, model,fsdp_strategy, fsdp_kwargs):   
+    def build_speculator(self, model, fsdp_strategy, fsdp_kwargs):
         assert model is not None, "model must be provided to build speculator"
         if fsdp_strategy == "fsdp":
-            self.speculator = self.adapter.build_and_attach(model, attach_to_model=True)
+            self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
             return self.speculator
         if fsdp_strategy == "fsdp2":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
             self.speculator = self.adapter.apply_fsdp2_speculator(model, fsdp_kwargs)
-            # model.speculator = self.speculator
-        
             return self.speculator
         
         raise ValueError(f"Unknown fsdp strategy: {fsdp_strategy}")
        
 
     def get_optimizer_params(self, fsdp_model):
-        if fsdp_model.speculator is not None:
+        if self.speculator is not None:
+            return self.speculator.parameters()
+        if hasattr(fsdp_model, "speculator") and fsdp_model.speculator is not None:
             return fsdp_model.speculator.parameters()
         return fsdp_model.parameters()   
 

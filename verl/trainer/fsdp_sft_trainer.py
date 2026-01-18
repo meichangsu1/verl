@@ -334,9 +334,9 @@ class FSDPSFTTrainer:
 
         fsdp_strategy = self.config.model.strategy
         if fsdp_strategy == "fsdp":
-            # Build and attach speculator before FSDP wrapping so it is wrapped together.
+            # Build speculator early to freeze base params, but keep it out of base FSDP.
             if self.has_speculator:
-                self.speculator_mgr.build_speculator(self.model, fsdp_strategy, None)
+                speculator_module = self.speculator_mgr.build_speculator(self.model, fsdp_strategy, None)
             self.fsdp_model = FSDP(
                 self.model,
                 cpu_offload=cpu_offload,
@@ -350,6 +350,21 @@ class FSDPSFTTrainer:
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
             )
+            if self.has_speculator:
+                self.speculator = FSDP(
+                    speculator_module,
+                    cpu_offload=cpu_offload,
+                    param_init_fn=init_fn,
+                    use_orig_params=False,
+                    auto_wrap_policy=None,
+                    device_id=get_device_id(),
+                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    mixed_precision=mixed_precision,
+                    sync_module_states=True,
+                    device_mesh=self.device_mesh,
+                    forward_prefetch=False,
+                )
+                self.speculator_mgr.speculator = self.speculator
         elif fsdp_strategy == "fsdp2":
 
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
@@ -368,7 +383,6 @@ class FSDPSFTTrainer:
                 self.speculator_mgr.build_speculator(self.model, fsdp_strategy, fsdp_kwargs)
             full_state = self.model.state_dict()
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
-            self.model.speculator = self.speculator_mgr.speculator
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
         else:
@@ -667,13 +681,14 @@ class FSDPSFTTrainer:
             processing_class=self.tokenizer,
             checkpoint_config=checkpoint_config_dict,
         )
-        if self.has_speculator and hasattr(self.fsdp_model, "speculator"):
-            speculator_module = self.fsdp_model.speculator
-            speculator_config_obj = getattr(speculator_module, "config", None)
-            self.checkpoint_manager.set_speculator(
-                speculator_module=speculator_module,
-                speculator_config_obj=speculator_config_obj,
-            )
+        if self.has_speculator and self.speculator_mgr is not None:
+            speculator_module = self.speculator_mgr.speculator
+            if speculator_module is not None:
+                speculator_config_obj = getattr(speculator_module, "config", None)
+                self.checkpoint_manager.set_speculator(
+                    speculator_module=speculator_module,
+                    speculator_config_obj=speculator_config_obj,
+                )
 
     def load_checkpoint(self):
         # Determine resume path based on configuration
