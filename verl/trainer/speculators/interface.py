@@ -83,16 +83,6 @@ class SpeculatorAdapter(ABC):
         seq_ids = input_ids[:, 1:]
         return hidden, seq_ids
 
-    def register_clone_inds_hook(self, speculator_module):
-        def _clone_inds_hook(_module, args):
-            if len(args) < 2:
-                return None
-            state, inds, *rest = args
-            inds = inds.clone().contiguous()
-            return (state, inds, *rest)
-
-        speculator_module.register_forward_pre_hook(_clone_inds_hook)
-
     def get_optimizer_params(self, fsdp_model):
         speculator_module = self._get_speculator_module(fsdp_model)
         if speculator_module is not None:
@@ -186,8 +176,6 @@ class SpeculatorManager:
         assert model is not None, "model must be provided to build speculator"
         if fsdp_strategy == "fsdp":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
-            if self.speculator is not None:
-                self.adapter.register_clone_inds_hook(self.speculator)
             return self.speculator
         if fsdp_strategy == "fsdp2":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
