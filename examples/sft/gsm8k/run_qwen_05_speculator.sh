@@ -27,7 +27,6 @@ shift 2
     +model.speculator.method=sum_lstm \
     +model.speculator.tie_lstm_embs=true \
     +model.speculator.tie_weights=true \
-    +model.freeze_base_model=true \
     +model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
     +model.use_remove_padding=false \
     trainer.default_local_dir=$save_path \

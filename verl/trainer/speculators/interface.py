@@ -19,17 +19,14 @@ This keeps trainers decoupled from concrete speculator implementations.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import os
 from typing import Any, Optional
 
 from verl.utils.import_utils import load_class_from_fqn, load_extern_object
-from verl.utils.checkpoint.fsdp_checkpoint_manager import load_speculator_checkpoint, save_speculator_checkpoint
 from verl.utils.fsdp_utils import fully_shard, maybe_patch_fsdp_module
 import torch
 
 
 class SpeculatorAdapter(ABC):
-    has_speculator: bool
     device_mesh: Any
     speculator: Any
 
@@ -54,22 +51,13 @@ class SpeculatorAdapter(ABC):
     ):
         """Compute speculator loss."""
 
-    def _maybe_shard_speculator(self, fsdp_model, speculator_module, fsdp_kwargs: Optional[dict]):
-        if speculator_module is None:
-            return speculator_module
-        if fully_shard is None:
-            return speculator_module
-        if not fsdp_kwargs:
-            raise ValueError("fsdp_kwargs must be provided when sharding speculator module")
+    def apply_fsdp2_speculator(self, fsdp_model, fsdp_kwargs: Optional[dict]):
+        assert self.speculator is not None, "Speculator module is not built yet."
+        speculator_module = self.speculator
         with maybe_patch_fsdp_module(speculator_module):
             speculator_module = fully_shard(speculator_module, **fsdp_kwargs)
-        fsdp_model.speculator = speculator_module
-        self.speculator = speculator_module
+        fsdp_model.speculator =speculator_module
         return speculator_module
-
-    def shard_speculator(self, fsdp_model, fsdp_kwargs: Optional[dict]):
-        speculator_module = self._get_speculator_module(fsdp_model)
-        return self._maybe_shard_speculator(fsdp_model, speculator_module, fsdp_kwargs)
 
     def _get_speculator_module(self, fsdp_model):
         if fsdp_model is not None and hasattr(fsdp_model, "speculator"):
@@ -95,34 +83,11 @@ class SpeculatorAdapter(ABC):
         seq_ids = input_ids[:, 1:]
         return hidden, seq_ids
 
-    def save_checkpoint(self, fsdp_model, local_global_step_folder: str):
-        if not getattr(self, "has_speculator", False):
-            return
+    def get_optimizer_params(self, fsdp_model):
         speculator_module = self._get_speculator_module(fsdp_model)
-        if speculator_module is None:
-            return
-        speculator_dir = os.path.join(local_global_step_folder, "speculator")
-        config_obj = self._get_speculator_config_obj(fsdp_model, speculator_module)
-        save_speculator_checkpoint(
-            fsdp_model,
-            speculator_module,
-            speculator_dir,
-            config_obj=config_obj,
-        )
-
-    def load_checkpoint(self, fsdp_model, checkpoint_path: str, logger):
-        if not getattr(self, "has_speculator", False):
-            return
-        speculator_module = self._get_speculator_module(fsdp_model)
-        if speculator_module is None:
-            return
-        load_speculator_checkpoint(
-            fsdp_model,
-            speculator_module,
-            checkpoint_path,
-            logger=logger,
-            device_mesh=getattr(self, "device_mesh", None),
-        )
+        if speculator_module is not None:
+            return speculator_module.parameters()
+        return fsdp_model.parameters()
 
 
 def _load_custom_adapter(speculator_adapter_config: Any):
@@ -186,7 +151,6 @@ class SpeculatorManager:
         self.torch_dtype = torch_dtype
         self.adapter: Optional[SpeculatorAdapter] = None
         self.speculator = None
-        self.has_speculator = False
         self._build_adapter()
 
     def _build_adapter(self) -> None:
@@ -207,39 +171,28 @@ class SpeculatorManager:
             self.device_mesh,
             self.torch_dtype,
         )
-        self.has_speculator = self.adapter.has_speculator
+    
 
-    def attach(self, fsdp_strategy, model=None, fsdp_model=None, fsdp_kwargs=None):
-        if self.adapter is None:
-            return None
+    def build_speculator(self, model,fsdp_strategy, fsdp_kwargs):   
+        assert model is not None, "model must be provided to build speculator"
         if fsdp_strategy == "fsdp":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=True)
             return self.speculator
         if fsdp_strategy == "fsdp2":
-            self.speculator = self.adapter.build_and_attach(fsdp_model, attach_to_model=True)
-            self.speculator = self.adapter.shard_speculator(fsdp_model, fsdp_kwargs)
+            self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
+            self.speculator = self.adapter.apply_fsdp2_speculator(model, fsdp_kwargs)
+            model.speculator = self.speculator
+        
             return self.speculator
-        raise NotImplementedError(f"not implement {fsdp_strategy}")
-
-    def build_speculator(self, model=None, fsdp_model=None):
-        if self.adapter is None:
-            return None
-        target_model = fsdp_model if fsdp_model is not None else model
-        if target_model is None:
-            return None
-        self.speculator = self.adapter.build_and_attach(target_model, attach_to_model=True)
-        return self.speculator
-
-    def shard_speculator(self, fsdp_model, fsdp_kwargs=None):
-        if self.adapter is None:
-            return None
-        self.speculator = self.adapter.shard_speculator(fsdp_model, fsdp_kwargs)
-        return self.speculator
+        
+        raise ValueError(f"Unknown fsdp strategy: {fsdp_strategy}")
+       
 
     def get_optimizer_params(self, fsdp_model):
-        if self.adapter is None:
-            return fsdp_model.parameters()
-        return self.adapter.get_optimizer_params(fsdp_model)
+        if fsdp_model.speculator is not None:
+            return fsdp_model.speculator.parameters()
+        return fsdp_model.parameters()   
+
 
     def compute_speculator_loss(
         self,
@@ -262,13 +215,3 @@ class SpeculatorManager:
             hidden_states=hidden_states,
             spec_logits=spec_logits,
         )
-
-    def save_checkpoint(self, fsdp_model, local_global_step_folder: str) -> None:
-        if self.adapter is None:
-            return
-        self.adapter.save_checkpoint(fsdp_model, local_global_step_folder)
-
-    def load_checkpoint(self, fsdp_model, checkpoint_path: str, logger) -> None:
-        if self.adapter is None:
-            return
-        self.adapter.load_checkpoint(fsdp_model, checkpoint_path, logger)

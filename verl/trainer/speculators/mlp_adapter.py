@@ -40,12 +40,11 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         if speculator_config is None:
             speculator_config = getattr(self.model_config, "speculator", None)
         self.speculator_config = speculator_config
-        self.has_speculator = self.speculator_config is not None
 
         self.speculator = None
 
     def build_and_attach(self, model, attach_to_model: bool = True):
-        if not self.has_speculator:
+        if self.speculator_config is None:
             return None
 
         hf_config = self.model_config.hf_config if hasattr(self.model_config, "hf_config") else self.model_config
@@ -90,10 +89,9 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         return self.speculator
 
     def get_optimizer_params(self, fsdp_model):
-        if self.has_speculator:
-            speculator_module = self._get_speculator_module(fsdp_model)
-            if speculator_module is not None:
-                return speculator_module.parameters()
+        speculator_module = self._get_speculator_module(fsdp_model)
+        if speculator_module is not None:
+            return speculator_module.parameters()
         return fsdp_model.parameters()
 
     def _get_speculator_module(self, fsdp_model):
@@ -113,9 +111,6 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         hidden_states=None,
         spec_logits=None,
     ):
-        if not self.has_speculator:
-            return torch.tensor(0.0, device=self.device_name)
-
         speculator_module = self._get_speculator_module(fsdp_model)
         if speculator_module is None:
             return torch.tensor(0.0, device=self.device_name)

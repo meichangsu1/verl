@@ -126,6 +126,7 @@ class FSDPSFTTrainer:
         self._build_dataloader(train_dataset, val_dataset)
 
         self.lora = self.config.model.get("lora_adapter_path") is not None or self.config.model.lora_rank > 0
+        self.has_speculator = self._compute_has_speculator()
 
         # Initialize resume-related variables
         self.resume_global_step = 0
@@ -151,21 +152,12 @@ class FSDPSFTTrainer:
             self.device_mesh,
             torch_dtype,
         )
-        self.has_speculator = self.speculator_mgr.has_speculator
         self.speculator = None
 
-    def _maybe_attach_speculator(self, fsdp_strategy, fsdp_kwargs=None):
-        if self.speculator_mgr is None:
-            self.speculator = None
-            return
-        if fsdp_strategy == "fsdp":
-            self.speculator = self.speculator_mgr.build_speculator(model=self.model)
-            return
-        if fsdp_strategy == "fsdp2":
-            self.speculator = self.speculator_mgr.build_speculator(fsdp_model=self.fsdp_model)
-            self.speculator = self.speculator_mgr.shard_speculator(self.fsdp_model, fsdp_kwargs)
-            return
-        raise NotImplementedError(f"not implement {fsdp_strategy}")
+    def _compute_has_speculator(self) -> bool:
+        speculator_cfg = getattr(self.config.model, "speculator", None)
+        speculator_adapter_cfg = getattr(self.config.model, "speculator_adapter", None)
+        return speculator_cfg is not None and speculator_adapter_cfg is not None
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -257,7 +249,12 @@ class FSDPSFTTrainer:
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
-        self._init_speculator_manager(torch_dtype)
+        self.has_speculator = self._compute_has_speculator()
+        if not self.has_speculator:
+            self.speculator_mgr = None
+            self.speculator = None
+        else:
+            self._init_speculator_manager(torch_dtype)
 
         # This may be very large
         init_context = get_init_weight_context_manager(
@@ -338,7 +335,8 @@ class FSDPSFTTrainer:
         fsdp_strategy = self.config.model.strategy
         if fsdp_strategy == "fsdp":
             # Build and attach speculator before FSDP wrapping so it is wrapped together.
-            self._maybe_attach_speculator(fsdp_strategy)
+            if self.has_speculator:
+                self.speculator_mgr.build_speculator(self.model, fsdp_strategy, None)
             self.fsdp_model = FSDP(
                 self.model,
                 cpu_offload=cpu_offload,
@@ -353,6 +351,7 @@ class FSDPSFTTrainer:
                 forward_prefetch=False,
             )
         elif fsdp_strategy == "fsdp2":
+
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
@@ -363,22 +362,25 @@ class FSDPSFTTrainer:
                 "mp_policy": mp_policy,
                 "offload_policy": cpu_offload,
                 "reshard_after_forward": True,
-            }
+            } 
+
+            if self.has_speculator:
+                self.speculator_mgr.build_speculator(self.model, fsdp_strategy, fsdp_kwargs)
             full_state = self.model.state_dict()
-            if self.speculator is not None:
-                full_state = {k: v for k, v in full_state.items() if not k.startswith("speculator.")}
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
-            self._maybe_attach_speculator(fsdp_strategy, fsdp_kwargs)
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
-        optimizer_params = self.speculator_mgr.get_optimizer_params(self.fsdp_model)
-        self.optimizer = build_optimizer(optimizer_params, self.config.optim)
+        if self.has_speculator:
+            optimizer_params = self.speculator_mgr.get_optimizer_params(self.fsdp_model)
+        else:
+            optimizer_params = self.fsdp_model.parameters()
 
+        self.optimizer = build_optimizer(optimizer_params, self.config.optim)
 
         log_gpu_memory_usage("After initialize optimizer", logger=logger)
 
@@ -576,7 +578,6 @@ class FSDPSFTTrainer:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
 
-
         return {
             "train/loss": step_loss.detach().item(),
             "train/lr(1e-3)": lr * 1e3,
@@ -680,6 +681,8 @@ class FSDPSFTTrainer:
         if checkpoint_path is None:
             return 0
 
+
+
         # extract resume step from checkpoint path
         resume_step = extract_step(checkpoint_path)
         if resume_step is None:
@@ -695,14 +698,14 @@ class FSDPSFTTrainer:
 
         # Use checkpoint manager to load model state
         self.checkpoint_manager.load_checkpoint(checkpoint_path)
+        if self.has_speculator:
+            self.checkpoint_manager.load_speculator_checkpoint(checkpoint_path, logger)
         log_with_rank(
             f"Successfully loaded model checkpoint from {checkpoint_path} (step {resume_step})",
             logger=logger,
             rank=self.device_mesh.get_rank(),
             log_only_rank_0=True,
         )
-        if self.has_speculator:
-            self.checkpoint_manager.load_speculator_checkpoint(checkpoint_path, logger)
 
         # Always load dataloader state for StatefulDataLoader
         self._load_dataloader_state(checkpoint_path)
