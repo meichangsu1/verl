@@ -368,6 +368,7 @@ class FSDPSFTTrainer:
                 self.speculator_mgr.build_speculator(self.model, fsdp_strategy, fsdp_kwargs)
             full_state = self.model.state_dict()
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
+            self.model.speculator = self.speculator_mgr.speculator
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
         else:
@@ -874,7 +875,7 @@ def run_sft(config):
     device_name = get_device_name()
     local_rank, rank, world_size = initialize_global_process_group()
 
-    device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp"))
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(
         device_type=device_name,

@@ -56,7 +56,7 @@ class SpeculatorAdapter(ABC):
         speculator_module = self.speculator
         with maybe_patch_fsdp_module(speculator_module):
             speculator_module = fully_shard(speculator_module, **fsdp_kwargs)
-        fsdp_model.speculator =speculator_module
+        # fsdp_model.speculator =speculator_module
         return speculator_module
 
     def _get_speculator_module(self, fsdp_model):
@@ -181,7 +181,7 @@ class SpeculatorManager:
         if fsdp_strategy == "fsdp2":
             self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
             self.speculator = self.adapter.apply_fsdp2_speculator(model, fsdp_kwargs)
-            model.speculator = self.speculator
+            # model.speculator = self.speculator
         
             return self.speculator
         
