@@ -355,7 +355,7 @@ class FSDPSFTTrainer:
                     speculator_module,
                     cpu_offload=cpu_offload,
                     param_init_fn=init_fn,
-                    use_orig_params=False,
+                    use_orig_params=True,
                     auto_wrap_policy=None,
                     device_id=get_device_id(),
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
