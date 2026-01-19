@@ -76,6 +76,8 @@ class SpeculatorAdapter(ABC):
     def _maybe_unpack_packed_hidden(self, input_ids, attention_mask, hidden_states, packed_seq_params):
         if packed_seq_params is None or hidden_states is None:
             return hidden_states
+        if isinstance(hidden_states, torch.Tensor) and hidden_states.is_nested:
+            return hidden_states
         if attention_mask is None:
             if isinstance(input_ids, torch.Tensor) and input_ids.is_nested:
                 offsets = input_ids.offsets().diff().tolist()
@@ -101,6 +103,8 @@ class SpeculatorAdapter(ABC):
         packed_states = hidden_states
         if hidden_states.dim() == 2:
             packed_states = hidden_states.unsqueeze(0)
+        elif hidden_states.dim() == 3 and hidden_states.size(1) == 1:
+            packed_states = hidden_states.transpose(0, 1)
         if packed_states.dim() >= 2 and packed_states.size(0) == 1:
             from verl.models.mcore.util import postprocess_packed_seqs
 
