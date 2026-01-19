@@ -14,6 +14,7 @@
 
 import logging
 import os
+import os
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, Callable, ContextManager, Iterator, Optional
@@ -610,6 +611,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
+        if os.getenv("VERL_DEBUG_SPECULATOR") == "1" and isinstance(input_ids, torch.Tensor):
+            if getattr(input_ids, "is_nested", False):
+                offsets = input_ids.offsets().diff()
+                print(
+                    f"[debug][engine] input_ids nested len={input_ids.size(0)} "
+                    f"max_len={input_ids.size(1)} offsets_head={offsets[:8].tolist()}"
+                )
+            else:
+                print(f"[debug][engine] input_ids shape={tuple(input_ids.shape)}")
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
         if not isinstance(temperature, torch.Tensor):
