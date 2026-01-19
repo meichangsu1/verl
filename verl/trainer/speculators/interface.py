@@ -85,6 +85,10 @@ class SpeculatorAdapter(ABC):
                 )
                 for i, seqlen in enumerate(offsets):
                     attention_mask[i, :seqlen] = True
+            elif isinstance(input_ids, torch.Tensor) and input_ids.dim() >= 2:
+                attention_mask = torch.ones(
+                    input_ids.shape[:2], dtype=torch.bool, device=input_ids.device
+                )
             else:
                 return hidden_states
         attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
