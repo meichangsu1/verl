@@ -238,8 +238,17 @@ def postprocess_bshd(
     batch_size = shape[0]
     shape[1] = origin_seqlen
     new_result = torch.zeros(dtype=result.dtype, device=result.device, size=shape)
+    result_seq_len = result.size(1)
     for i in range(batch_size):
-        new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
+        orig_mask_raw = original_attention_mask[i]
+        attn_mask_raw = attention_mask[i]
+        orig_mask = torch.zeros(origin_seqlen, dtype=torch.bool, device=orig_mask_raw.device)
+        attn_mask = torch.zeros(result_seq_len, dtype=torch.bool, device=attn_mask_raw.device)
+        orig_len = min(origin_seqlen, result_seq_len, orig_mask_raw.numel())
+        attn_len = min(result_seq_len, attn_mask_raw.numel())
+        orig_mask[:orig_len] = orig_mask_raw[:orig_len]
+        attn_mask[:attn_len] = attn_mask_raw[:attn_len]
+        new_result[i, orig_mask] = result[i, attn_mask]
     return new_result
 
 
