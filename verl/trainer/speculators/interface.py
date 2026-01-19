@@ -62,7 +62,7 @@ class SpeculatorAdapter(ABC):
     def _get_speculator_module(self):
         return getattr(self, "speculator", None)
 
-    def _get_speculator_config_obj(self, fsdp_model, speculator_module):
+    def _get_speculator_config_obj(self, speculator_module):
         if speculator_module is None:
             return None
         return getattr(speculator_module, "config", None)

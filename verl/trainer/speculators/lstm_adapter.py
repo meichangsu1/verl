@@ -132,7 +132,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
 
 
 
-    def _get_speculator_config_obj(self, fsdp_model, speculator_module):
+    def _get_speculator_config_obj(self, speculator_module):
         if speculator_module is None:
             return None
         base_model_name_or_path = None

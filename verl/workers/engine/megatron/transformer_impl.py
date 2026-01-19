@@ -719,7 +719,9 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         if not self.has_speculator:
             return
         speculator_module = self.speculator
-        speculator_config_obj = getattr(speculator_module, "config", None) if speculator_module is not None else None
+        speculator_config_obj = None
+        if speculator_module is not None and self.speculator_adapter is not None:
+            speculator_config_obj = self.speculator_adapter._get_speculator_config_obj(speculator_module)
         self.checkpoint_mananager.set_speculator(
             speculator_module=speculator_module,
             speculator_config_obj=speculator_config_obj,

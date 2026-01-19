@@ -1088,8 +1088,8 @@ class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
         super().initialize()
         if not self.has_speculator or self.checkpoint_manager is None:
             return
-        if self.speculator is not None:
-            speculator_config_obj = getattr(self.speculator, "config", None)
+        if self.speculator is not None and self.speculator_adapter is not None:
+            speculator_config_obj = self.speculator_adapter._get_speculator_config_obj(self.speculator)
             self.checkpoint_manager.set_speculator(
                 speculator_module=self.speculator,
                 speculator_config_obj=speculator_config_obj,
