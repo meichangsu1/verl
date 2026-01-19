@@ -33,6 +33,7 @@ def preprocess_packed_seqs(
     """
     batch_size = input_ids.shape[0]
 
+    attention_mask = attention_mask.to(torch.bool)
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
