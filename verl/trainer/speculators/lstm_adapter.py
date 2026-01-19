@@ -186,6 +186,9 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 hidden = hidden_out.hidden_states[-1]
         else:
             hidden = self._maybe_pad_nested(hidden_states, padding=0.0)
+        spec_dtype = next(speculator_module.parameters()).dtype
+        if hidden.dtype != spec_dtype:
+            hidden = hidden.to(dtype=spec_dtype)
         if spec_logits is None:
             spec_logits = self.compute_speculator_logits(input_ids, hidden)
 
