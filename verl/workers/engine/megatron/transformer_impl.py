@@ -831,7 +831,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         metrics = {"train/speculator_loss": spec_loss_value}
         output = {
             "model_output": {},
-            "loss": spec_loss.detach().item(),
+            "loss": spec_loss_value,
             "metrics": metrics,
         }
         return scaled_loss, output
