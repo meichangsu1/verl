@@ -192,6 +192,7 @@ def preprocess_bshd(
     assert cp_size == 1, "Context parallel size without seq_pack is not supported"
     batch_size = input_ids.shape[0]
     shape = list(input_ids.shape)  # batch_size, seq_len,...
+    attention_mask = attention_mask.to(torch.bool)
     seq_lens = attention_mask.sum(dim=1)
     seq_len = seq_lens.max().item()
     if sequence_parallel:
