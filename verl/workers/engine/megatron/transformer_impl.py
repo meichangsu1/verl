@@ -827,7 +827,8 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             packed_seq_params=packed_seq_params,
         )
         scaled_loss = spec_loss * data["num_micro_batch"]
-        metrics = {"train/speculator_loss": spec_loss.detach().item()}
+        spec_loss_value = spec_loss.detach().item() if isinstance(spec_loss, torch.Tensor) else float(spec_loss)
+        metrics = {"train/speculator_loss": spec_loss_value}
         output = {
             "model_output": {},
             "loss": spec_loss.detach().item(),
