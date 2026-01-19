@@ -16,6 +16,7 @@
 
 import torch
 from contextlib import contextmanager
+import os
 
 from verl.utils.megatron_utils import unwrap_model
 
@@ -293,6 +294,12 @@ def gptmodel_forward_no_padding_with_hidden(
         from verl.models.mcore.util import postprocess_thd_no_padding
 
         output = postprocess_thd_no_padding(output, packed_seq_params, input_ids, input_ids.shape[0], post_process=True)
+    if isinstance(output, torch.Tensor) and output.is_nested and os.getenv("VERL_DEBUG_SPECULATOR") == "1":
+        offsets = output.offsets().diff()
+        print(
+            f"[debug][model_forward] hidden nested len={output.size(0)} "
+            f"max_len={output.size(1)} offsets_head={offsets[:8].tolist()}"
+        )
     return {
         "hidden_states": output,
         "packed_seq_params": packed_seq_params,

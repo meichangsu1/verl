@@ -19,7 +19,7 @@ from torch import nn
 from verl.trainer.speculators.interface import SpeculatorAdapter
 import transformers
 from verl.trainer.speculators.config import SpeculatorConfigBase
-
+import os
 
 class ArcticLSTMSpeculatorConfig(SpeculatorConfigBase):
     """
@@ -232,6 +232,10 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
             return None
 
         n_predict = speculator_module.n_predict
+        if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
+            print(
+                f"[debug][spec_logits] input_ids shape={tuple(input_ids.shape)} hidden shape={tuple(hidden_states.shape)}"
+            )
         hidden, seq_ids = self._slice_speculator_inputs(input_ids, hidden_states, n_predict)
         pad_ids = torch.zeros(input_ids.size(0), n_predict, dtype=seq_ids.dtype, device=seq_ids.device)
         spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
