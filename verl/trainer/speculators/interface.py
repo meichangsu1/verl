@@ -94,11 +94,15 @@ class SpeculatorAdapter(ABC):
             hidden_states.size(1) == attention_mask.size(1)
         ):
             return hidden_states
-        if hidden_states.dim() >= 2 and hidden_states.size(0) == 1:
+        packed_states = hidden_states
+        if hidden_states.dim() == 2:
+            packed_states = hidden_states.unsqueeze(0)
+        if packed_states.dim() >= 2 and packed_states.size(0) == 1:
             from verl.models.mcore.util import postprocess_packed_seqs
 
             batch_size, seq_len = attention_mask.shape[:2]
-            return postprocess_packed_seqs(hidden_states, packed_seq_params, attention_mask, batch_size, seq_len)
+            unpacked = postprocess_packed_seqs(packed_states, packed_seq_params, attention_mask, batch_size, seq_len)
+            return unpacked
         return hidden_states
 
     def _slice_speculator_inputs(self, input_ids, hidden_states, n_predict):
