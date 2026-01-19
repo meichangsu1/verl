@@ -3,13 +3,14 @@ export TORCHINDUCTOR_DISABLE=1
 export TORCH_COMPILE=0
 export PYTORCH_JIT=0
 
+
 torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   -m verl.trainer.sft_trainer \
-  data.train_files=/model/ljl/arctic-traing-datasets/data/train.parquet \
-  data.val_files=/model/ljl/arctic-traing-datasets/data/test.parquet \
-  data.pad_mode=no_padding \
+  data.train_files=$HOME/data/multiturn/train.parquet \
+  data.val_files=$HOME/data/multiturn/test.parquet \
+  ++data.pad_mode=no_padding \
   data.micro_batch_size_per_gpu=1 \
-  model.path=/model/ljl/Qwen3MoeCustom3  \
+  model.path=/root/autodl-tmp/qwen3_moe_small  \
   model.use_remove_padding=true \
   ++model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
   ++model.speculator.n_predict=3 \
