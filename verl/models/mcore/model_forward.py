@@ -116,7 +116,7 @@ def model_forward_gen(vision_model: bool = False):
 
             batch_size, sequence_length = attention_mask.shape[:2]
             new_input_ids, new_attention_mask, new_position_ids = preprocess_bshd(
-                input_ids, attention_mask, position_ids, sequence_parallel=sp, pre_process=pre_process
+                input_ids, attention_mask, position_ids, sequence_parallel=False, pre_process=pre_process
             )
             output_orig = model(
                 input_ids=new_input_ids,
