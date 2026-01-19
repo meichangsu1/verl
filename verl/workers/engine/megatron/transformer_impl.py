@@ -801,6 +801,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
                 raise ValueError("pad_mode requires attention_mask and position_ids in batch for megatron.")
             from verl.models.mcore.model_forward import model_forward_with_hidden
 
+            data_format = "thd"
             output = model_forward_with_hidden(
                 model,
                 input_ids,

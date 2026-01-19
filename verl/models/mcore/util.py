@@ -230,6 +230,8 @@ def postprocess_bshd(
     """
     if not post_process:
         return result
+    attention_mask = attention_mask.to(torch.bool)
+    original_attention_mask = original_attention_mask.to(torch.bool)
     shape = list(result.shape)
     batch_size = shape[0]
     shape[1] = origin_seqlen
