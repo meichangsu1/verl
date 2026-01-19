@@ -129,6 +129,7 @@ def postprocess_packed_seqs(
     """
     if not post_process:
         return output
+    attention_mask = attention_mask.to(torch.bool)
 
     # -------------------------------------------------------------------------
     # Move the lengths and offsets needed for subsequent Python-level indexing to the CPU in advance,
@@ -392,6 +393,8 @@ def postprocess_thd_no_padding(
     """
     if not post_process:
         return output
+    attention_mask = attention_mask.to(torch.bool)
+    labels_mask = labels_mask.to(torch.bool)
 
     # -------------------------------------------------------------------------
     # Move the lengths and offsets needed for subsequent Python-level indexing to the CPU in advance,
