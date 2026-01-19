@@ -89,7 +89,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
 
         self.speculator = None
 
-    def build_and_attach(self, model, attach_to_model: bool = True):
+    def build_speculator_module(self, model):
         if self.speculator_config is None:
             return None
 
@@ -117,8 +117,6 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         else:
             config_obj = types.SimpleNamespace(**speculator_config_dict)
             self.speculator = speculator_mod.ArcticLSTMSpeculator(config_obj)
-        if attach_to_model:
-            model.speculator = self.speculator
 
         for param in model.parameters():
             param.requires_grad = False
@@ -166,7 +164,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         hidden_states=None,
         spec_logits=None,
     ):
-        speculator_module = self._get_speculator_module(fsdp_model)
+        speculator_module = self._get_speculator_module()
         if speculator_module is None:
             return torch.tensor(0.0, device=self.device_name)
 
@@ -189,7 +187,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         else:
             hidden = self._maybe_pad_nested(hidden_states, padding=0.0)
         if spec_logits is None:
-            spec_logits = self.compute_speculator_logits(fsdp_model, input_ids, hidden)
+            spec_logits = self.compute_speculator_logits(input_ids, hidden)
 
         n_predict = speculator_module.n_predict
         vocab_size = spec_logits.size(-1)
@@ -219,8 +217,8 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         spec_loss = spec_loss_accum / n_predict
         return spec_loss
 
-    def compute_speculator_logits(self, fsdp_model, input_ids, hidden_states):
-        speculator_module = self._get_speculator_module(fsdp_model)
+    def compute_speculator_logits(self, input_ids, hidden_states):
+        speculator_module = self._get_speculator_module()
         if speculator_module is None:
             return None
 

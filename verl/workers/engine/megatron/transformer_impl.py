@@ -45,7 +45,7 @@ from verl.utils.megatron_utils import (
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
-from verl.trainer.speculators.interface import SpeculatorManager
+from verl.trainer.speculators.interface import build_speculator_adapter
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import postprocess_batch_func, prepare_micro_batches
@@ -708,7 +708,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         checkpoint_config: CheckpointConfig,
     ):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
-        self.speculator_mgr: Optional[SpeculatorManager] = None
+        self.speculator_adapter = None
         self.speculator = None
         self.has_speculator = getattr(self.model_config, "speculator", None) is not None
 
@@ -718,7 +718,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             return
         if not self.has_speculator:
             return
-        speculator_module = getattr(self.module[-1], "speculator", None) if self.module else None
+        speculator_module = self.speculator
         speculator_config_obj = getattr(speculator_module, "config", None) if speculator_module is not None else None
         self.checkpoint_mananager.set_speculator(
             speculator_module=speculator_module,
@@ -727,11 +727,11 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             speculator_builder=self._ensure_speculator_for_checkpoint,
         )
 
-    def _init_speculator_manager(self) -> None:
-        if self.speculator_mgr is not None:
+    def _init_speculator_adapter(self) -> None:
+        if self.speculator_adapter is not None:
             return
         device_mesh = SimpleNamespace(get_rank=lambda: torch.distributed.get_rank())
-        self.speculator_mgr = SpeculatorManager(
+        self.speculator_adapter = build_speculator_adapter(
             config=None,
             model_config=self.model_config,
             device_name=get_device_name(),
@@ -740,12 +740,14 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         )
 
     def _attach_speculator(self) -> None:
-        if self.speculator_mgr is None or not self.has_speculator:
+        if self.speculator_adapter is None or not self.has_speculator:
             return
         if not self.module:
             return
         last_stage = self.module[-1]
-        self.speculator = self.speculator_mgr.build_speculator(model=last_stage)
+        self.speculator = self.speculator_adapter.build_speculator_module(last_stage)
+        if self.speculator is not None:
+            self.speculator_adapter.speculator = self.speculator
         for module in self.module:
             for param in module.parameters():
                 param.requires_grad = False
@@ -754,17 +756,15 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
                 param.requires_grad = True
 
     def _ensure_speculator_for_checkpoint(self):
-        if self.speculator_mgr is None:
-            self._init_speculator_manager()
+        if self.speculator_adapter is None:
+            self._init_speculator_adapter()
         if self.speculator is None:
             self._attach_speculator()
-        if not self.module:
-            return None
-        return getattr(self.module[-1], "speculator", None)
+        return self.speculator
 
     def _build_optimizer(self):
         if self.has_speculator and self.speculator is None:
-            self._init_speculator_manager()
+            self._init_speculator_adapter()
             self._attach_speculator()
         return super()._build_optimizer()
 
@@ -798,7 +798,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
 
     def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
         hidden_states = output["hidden_states"] if isinstance(output, dict) else output
-        spec_loss = self.speculator_mgr.compute_speculator_loss(
+        spec_loss = self.speculator_adapter.compute_speculator_loss(
             self.module[-1],
             input_ids=data["input_ids"],
             attention_mask=data.get("attention_mask", None),

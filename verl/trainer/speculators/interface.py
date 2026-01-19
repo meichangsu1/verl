@@ -31,11 +31,11 @@ class SpeculatorAdapter(ABC):
     speculator: Any
 
     @abstractmethod
-    def build_and_attach(self, model, attach_to_model: bool = True):
+    def build_speculator_module(self, model):
         """Build and optionally attach a speculator module to the model."""
 
     @abstractmethod
-    def get_optimizer_params(self, fsdp_model):
+    def get_optimizer_params(self):
         """Return the parameters to optimize."""
 
     @abstractmethod
@@ -59,12 +59,8 @@ class SpeculatorAdapter(ABC):
         # fsdp_model.speculator =speculator_module
         return speculator_module
 
-    def _get_speculator_module(self, fsdp_model):
-        if fsdp_model is not None and hasattr(fsdp_model, "speculator"):
-            return fsdp_model.speculator
-        if hasattr(self, "speculator"):
-            return self.speculator
-        return None
+    def _get_speculator_module(self):
+        return getattr(self, "speculator", None)
 
     def _get_speculator_config_obj(self, fsdp_model, speculator_module):
         if speculator_module is None:
@@ -83,11 +79,11 @@ class SpeculatorAdapter(ABC):
         seq_ids = input_ids[:, 1:]
         return hidden, seq_ids
 
-    def get_optimizer_params(self, fsdp_model):
-        speculator_module = self._get_speculator_module(fsdp_model)
+    def get_optimizer_params(self):
+        speculator_module = self._get_speculator_module()
         if speculator_module is not None:
             return speculator_module.parameters()
-        return fsdp_model.parameters()
+        return None
 
 
 def _load_custom_adapter(speculator_adapter_config: Any):
@@ -133,84 +129,3 @@ def build_speculator_adapter(
         device_mesh=device_mesh,
         torch_dtype=torch_dtype,
     )
-
-
-class SpeculatorManager:
-    def __init__(
-        self,
-        config,
-        model_config,
-        device_name,
-        device_mesh,
-        torch_dtype,
-    ):
-        self.config = config
-        self.model_config = model_config
-        self.device_name = device_name
-        self.device_mesh = device_mesh
-        self.torch_dtype = torch_dtype
-        self.adapter: Optional[SpeculatorAdapter] = None
-        self.speculator = None
-        self._build_adapter()
-
-    def _build_adapter(self) -> None:
-        speculator_config = None
-        if self.config is not None and hasattr(self.config, "model"):
-            speculator_config = getattr(self.config.model, "speculator", None)
-            speculator_adapter_config = getattr(self.config.model, "speculator_adapter", None)
-        else:
-            speculator_adapter_config = getattr(self.model_config, "speculator_adapter", None)
-
-        if speculator_config is None and speculator_adapter_config is None:
-            return
-
-        self.adapter = build_speculator_adapter(
-            self.config,
-            self.model_config,
-            self.device_name,
-            self.device_mesh,
-            self.torch_dtype,
-        )
-
-    def build_speculator(self, model, fsdp_strategy, fsdp_kwargs):
-        assert model is not None, "model must be provided to build speculator"
-        if fsdp_strategy == "fsdp":
-            self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
-            return self.speculator
-        if fsdp_strategy == "fsdp2":
-            self.speculator = self.adapter.build_and_attach(model, attach_to_model=False)
-            self.speculator = self.adapter.apply_fsdp2_speculator(model, fsdp_kwargs)
-            return self.speculator
-        
-        raise ValueError(f"Unknown fsdp strategy: {fsdp_strategy}")
-       
-
-    def get_optimizer_params(self, fsdp_model):
-        if self.speculator is not None:
-            return self.speculator.parameters()
-        if hasattr(fsdp_model, "speculator") and fsdp_model.speculator is not None:
-            return fsdp_model.speculator.parameters()
-        return fsdp_model.parameters()   
-
-
-    def compute_speculator_loss(
-        self,
-        fsdp_model: Any,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        loss_mask: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        spec_logits: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if self.adapter is None:
-            return None
-        return self.adapter.compute_speculator_loss(
-            fsdp_model,
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            loss_mask=loss_mask,
-            hidden_states=hidden_states,
-            spec_logits=spec_logits,
-        )
