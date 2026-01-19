@@ -241,13 +241,13 @@ class MegatronEngine(BaseEngine):
         if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
             total_params = 0
             trainable_params = 0
-            for p in self.module.parameters():
-                total_params += p.numel()
-                if p.requires_grad:
-                    trainable_params += p.numel()
-            print(
-                f"[debug][optimizer] total_params={total_params} trainable_params={trainable_params}"
-            )
+            modules = self.module if isinstance(self.module, (list, tuple)) else [self.module]
+            for module in modules:
+                for p in module.parameters():
+                    total_params += p.numel()
+                    if p.requires_grad:
+                        trainable_params += p.numel()
+            print(f"[debug][optimizer] total_params={total_params} trainable_params={trainable_params}")
         optimizer = get_megatron_optimizer(model=self.module, config=optim_config_megatron)
         if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
             group_count = len(optimizer.param_groups)
