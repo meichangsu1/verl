@@ -232,27 +232,12 @@ def postprocess_bshd(
     """
     if not post_process:
         return result
-    attention_mask = attention_mask.to(torch.bool)
-    original_attention_mask = original_attention_mask.to(torch.bool)
     shape = list(result.shape)
-    batch_size = min(shape[0], attention_mask.shape[0], original_attention_mask.shape[0])
-    result = result[:batch_size]
-    attention_mask = attention_mask[:batch_size]
-    original_attention_mask = original_attention_mask[:batch_size]
-    shape[0] = batch_size
+    batch_size = shape[0]
     shape[1] = origin_seqlen
     new_result = torch.zeros(dtype=result.dtype, device=result.device, size=shape)
-    result_seq_len = result.size(1)
     for i in range(batch_size):
-        orig_mask_raw = original_attention_mask[i]
-        attn_mask_raw = attention_mask[i]
-        orig_mask = torch.zeros(origin_seqlen, dtype=torch.bool, device=orig_mask_raw.device)
-        attn_mask = torch.zeros(result_seq_len, dtype=torch.bool, device=attn_mask_raw.device)
-        orig_len = min(origin_seqlen, result_seq_len, orig_mask_raw.numel())
-        attn_len = min(result_seq_len, attn_mask_raw.numel())
-        orig_mask[:orig_len] = orig_mask_raw[:orig_len]
-        attn_mask[:attn_len] = attn_mask_raw[:attn_len]
-        new_result[i, orig_mask] = result[i, attn_mask]
+        new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
     return new_result
 
 
@@ -406,7 +391,6 @@ def postprocess_thd_no_padding(
     """
     if not post_process:
         return output
-    attention_mask = attention_mask.to(torch.bool)
     labels_mask = labels_mask.to(torch.bool)
 
     # -------------------------------------------------------------------------

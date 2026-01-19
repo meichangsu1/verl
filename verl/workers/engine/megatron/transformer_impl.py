@@ -815,13 +815,16 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
 
     def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
         hidden_states = output["hidden_states"] if isinstance(output, dict) else output
+        packed_seq_params = output.get("packed_seq_params", None) if isinstance(output, dict) else None
+        attention_mask = output.get("attention_mask", None) if isinstance(output, dict) else data.get("attention_mask", None)
         spec_loss = self.speculator_adapter.compute_speculator_loss(
             self.module[-1],
             input_ids=data["input_ids"],
-            attention_mask=data.get("attention_mask", None),
+            attention_mask=attention_mask,
             position_ids=data.get("position_ids", None),
             loss_mask=data["loss_mask"],
             hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
         )
         scaled_loss = spec_loss * data["num_micro_batch"]
         metrics = {"train/speculator_loss": spec_loss.detach().item()}

@@ -48,6 +48,7 @@ class SpeculatorAdapter(ABC):
         loss_mask=None,
         hidden_states=None,
         spec_logits=None,
+        packed_seq_params=None,
     ):
         """Compute speculator loss."""
 
@@ -71,6 +72,34 @@ class SpeculatorAdapter(ABC):
         if isinstance(tensor, torch.Tensor) and tensor.is_nested:
             return torch.nested.to_padded_tensor(tensor, padding=padding)
         return tensor
+
+    def _maybe_unpack_packed_hidden(self, input_ids, attention_mask, hidden_states, packed_seq_params):
+        if packed_seq_params is None or hidden_states is None:
+            return hidden_states
+        if attention_mask is None:
+            if isinstance(input_ids, torch.Tensor) and input_ids.is_nested:
+                offsets = input_ids.offsets().diff().tolist()
+                seq_len = max(offsets) if offsets else 0
+                attention_mask = torch.zeros(
+                    (len(offsets), seq_len), dtype=torch.bool, device=input_ids.device
+                )
+                for i, seqlen in enumerate(offsets):
+                    attention_mask[i, :seqlen] = True
+            else:
+                return hidden_states
+        attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
+        if attention_mask is None:
+            return hidden_states
+        if hidden_states.dim() >= 2 and hidden_states.size(0) == attention_mask.size(0) and (
+            hidden_states.size(1) == attention_mask.size(1)
+        ):
+            return hidden_states
+        if hidden_states.dim() >= 2 and hidden_states.size(0) == 1:
+            from verl.models.mcore.util import postprocess_packed_seqs
+
+            batch_size, seq_len = attention_mask.shape[:2]
+            return postprocess_packed_seqs(hidden_states, packed_seq_params, attention_mask, batch_size, seq_len)
+        return hidden_states
 
     def _slice_speculator_inputs(self, input_ids, hidden_states, n_predict):
         # Alignment rule: hidden_states[t] should predict tokens starting at input_ids[t+1],

@@ -163,6 +163,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         loss_mask=None,
         hidden_states=None,
         spec_logits=None,
+        packed_seq_params=None,
     ):
         speculator_module = self._get_speculator_module()
         if speculator_module is None:
@@ -170,9 +171,12 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
+        original_input_ids = input_ids
         input_ids = self._maybe_pad_nested(input_ids, padding=0)
         if loss_mask is not None:
             loss_mask = self._maybe_pad_nested(loss_mask, padding=0)
+        if attention_mask is not None:
+            attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
 
         if hidden_states is None:
             with torch.no_grad():
@@ -186,6 +190,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 hidden = hidden_out.hidden_states[-1]
         else:
             hidden = self._maybe_pad_nested(hidden_states, padding=0.0)
+        hidden = self._maybe_unpack_packed_hidden(original_input_ids, attention_mask, hidden, packed_seq_params)
         spec_dtype = next(speculator_module.parameters()).dtype
         if hidden.dtype != spec_dtype:
             hidden = hidden.to(dtype=spec_dtype)

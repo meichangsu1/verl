@@ -168,6 +168,7 @@ def gptmodel_forward_no_padding(
     vision_model=False,
     pad_token_id=None,
     data_format: str = "thd",
+    return_packed_seq_params: bool = False,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
@@ -186,6 +187,7 @@ def gptmodel_forward_no_padding(
         model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
     batch_size = input_ids.shape[0]
+    packed_seq_params = None
     if data_format == "thd":
         input_ids_rmpad, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
@@ -259,6 +261,8 @@ def gptmodel_forward_no_padding(
         # so we use `squeeze` to remove the last dimension
         output = output.squeeze(-1)
 
+    if return_packed_seq_params:
+        return output, packed_seq_params
     return output
 
 
@@ -273,7 +277,7 @@ def gptmodel_forward_no_padding_with_hidden(
     """Forward pass that returns hidden states without running post_process/logits."""
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
     with _disable_post_process(model):
-        return gptmodel_forward_no_padding(
+        output, packed_seq_params = gptmodel_forward_no_padding(
             model,
             input_ids,
             multi_modal_inputs,
@@ -283,7 +287,12 @@ def gptmodel_forward_no_padding_with_hidden(
             vision_model=vision_model,
             pad_token_id=pad_token_id,
             data_format=data_format,
+            return_packed_seq_params=True,
         )
+    return {
+        "hidden_states": output,
+        "packed_seq_params": packed_seq_params,
+    }
 
 
 def model_forward_with_hidden(
@@ -348,4 +357,8 @@ def model_forward_with_hidden(
             output = postprocess_bshd(
                 output_orig, new_attention_mask, attention_mask, seq_len, post_process=True
             )
-    return output
+    return {
+        "hidden_states": output,
+        "packed_seq_params": packed_seq_params if data_format == "thd" else None,
+        "attention_mask": attention_mask,
+    }
