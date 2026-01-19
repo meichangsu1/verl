@@ -290,6 +290,11 @@ def gptmodel_forward_no_padding_with_hidden(
             data_format=data_format,
             return_packed_seq_params=True,
         )
+    if data_format == "thd" and isinstance(output, torch.Tensor):
+        if output.dim() == 2:
+            output = output.unsqueeze(0)
+        elif output.dim() == 3 and output.size(1) == 1 and output.size(0) != 1:
+            output = output.transpose(0, 1)
     if data_format == "thd" and isinstance(output, torch.Tensor) and not output.is_nested:
         from verl.models.mcore.util import postprocess_thd_no_padding
 
