@@ -391,7 +391,7 @@ def postprocess_thd_no_padding(
     """
     if not post_process:
         return output
-    labels_mask = labels_mask.to(torch.bool)
+    # labels_mask is not used for thd postprocess; keep for backward compatibility if added later.
 
     # -------------------------------------------------------------------------
     # Move the lengths and offsets needed for subsequent Python-level indexing to the CPU in advance,
