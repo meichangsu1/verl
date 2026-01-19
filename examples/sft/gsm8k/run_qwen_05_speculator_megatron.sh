@@ -1,21 +1,10 @@
-set -x
-
-if [ "$#" -lt 2 ]; then
-    echo "Usage: run_qwen_05_speculator_engine.sh <nproc_per_node> <save_path> [other_configs...]"
-    exit 1
-fi
-
-nproc_per_node=$1
-save_path=$2
-
-# Shift the arguments so $@ refers to the rest
-shift 2
 torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   -m verl.trainer.sft_trainer \
-  data.train_files=$HOME/data/gsm8k/train.parquet \
-  data.val_files=$HOME/data/gsm8k/test.parquet \
+  data.train_files=/model/ljl/arctic-traing-datasets/data/train.parquet \
+  data.val_files=/model/ljl/arctic-traing-datasets/data/test.parquet \
+  ++data.pad_mode=right \
   data.micro_batch_size_per_gpu=1 \
-  model.path=/path/to/your/model \
+  model.path=/model/ljl/Qwen3MoeCustom3  \
   model.use_remove_padding=false \
   ++model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
   ++model.speculator.n_predict=3 \

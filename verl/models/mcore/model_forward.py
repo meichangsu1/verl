@@ -284,3 +284,28 @@ def gptmodel_forward_no_padding_with_hidden(
             pad_token_id=pad_token_id,
             data_format=data_format,
         )
+
+
+def model_forward_with_hidden(
+    model,
+    input_ids,
+    attention_mask,
+    position_ids,
+    multi_modal_inputs: dict,
+    vision_model=False,
+    data_format: str = "thd",
+):
+    """Forward pass that returns hidden states with padding inputs."""
+    assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
+    forward_fn = model_forward_gen(vision_model)
+    with _disable_post_process(model):
+        return forward_fn(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids,
+            multi_modal_inputs,
+            logits_processor=None,
+            logits_processor_args=None,
+            data_format=data_format,
+        )

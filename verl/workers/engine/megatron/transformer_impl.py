@@ -782,19 +782,34 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         if use_fused_kernels:
             raise NotImplementedError("Fused kernels are not supported for megatron engine")
 
-        from verl.models.mcore.model_forward import gptmodel_forward_no_padding_with_hidden
-
-        output = gptmodel_forward_no_padding_with_hidden(
-            model,
-            input_ids,
-            multi_modal_inputs,
-            vision_model=hasattr(self.model_config.hf_config, "vision_config"),
-            pad_token_id=self.model_config.tokenizer.pad_token_id,
-            data_format="thd" if self.engine_config.use_remove_padding else "bshd",
-        )
-
+        data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
         if pad_mode == DatasetPadMode.NO_PADDING:
-            raise NotImplementedError("Speculator training requires use_remove_padding=False in megatron")
+            from verl.models.mcore.model_forward import gptmodel_forward_no_padding_with_hidden
+
+            output = gptmodel_forward_no_padding_with_hidden(
+                model,
+                input_ids,
+                multi_modal_inputs,
+                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                pad_token_id=self.model_config.tokenizer.pad_token_id,
+                data_format=data_format,
+            )
+        else:
+            attention_mask = batch.get("attention_mask", None)
+            position_ids = batch.get("position_ids", None)
+            if attention_mask is None or position_ids is None:
+                raise ValueError("pad_mode requires attention_mask and position_ids in batch for megatron.")
+            from verl.models.mcore.model_forward import model_forward_with_hidden
+
+            output = model_forward_with_hidden(
+                model,
+                input_ids,
+                attention_mask,
+                position_ids,
+                multi_modal_inputs,
+                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                data_format=data_format,
+            )
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 
