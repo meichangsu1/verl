@@ -238,7 +238,21 @@ class MegatronEngine(BaseEngine):
             use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
             fp16=self.param_dtype == torch.float16,
         )
+        if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
+            total_params = 0
+            trainable_params = 0
+            for p in self.module.parameters():
+                total_params += p.numel()
+                if p.requires_grad:
+                    trainable_params += p.numel()
+            print(
+                f"[debug][optimizer] total_params={total_params} trainable_params={trainable_params}"
+            )
         optimizer = get_megatron_optimizer(model=self.module, config=optim_config_megatron)
+        if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
+            group_count = len(optimizer.param_groups)
+            group_sizes = [len(g.get("params", [])) for g in optimizer.param_groups]
+            print(f"[debug][optimizer] param_groups={group_count} sizes={group_sizes}")
         register_megatron_training_hooks(self.module, optimizer)
         return optimizer
 
