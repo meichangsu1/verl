@@ -175,6 +175,8 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         input_ids = self._maybe_pad_nested(input_ids, padding=0)
         if loss_mask is not None:
             loss_mask = self._maybe_pad_nested(loss_mask, padding=0)
+        if attention_mask is None and loss_mask is not None:
+            attention_mask = loss_mask > 0
         if attention_mask is not None:
             attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
 
