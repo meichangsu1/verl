@@ -233,9 +233,22 @@ class MegatronEngine(BaseEngine):
     def _build_optimizer(self):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, init_megatron_optim_config
 
+        use_dist_opt = self.engine_config.use_distributed_optimizer
+        if self.has_speculator:
+            total_params = 0
+            trainable_params = 0
+            modules = self.module if isinstance(self.module, (list, tuple)) else [self.module]
+            for module in modules:
+                for p in module.parameters():
+                    total_params += p.numel()
+                    if p.requires_grad:
+                        trainable_params += p.numel()
+            if trainable_params > 0 and trainable_params < total_params:
+                # Speculator-only training can break distributed optimizer param mapping.
+                use_dist_opt = False
         optim_config_megatron = init_megatron_optim_config(
             self.optimizer_config,
-            use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
+            use_distributed_optimizer=use_dist_opt,
             fp16=self.param_dtype == torch.float16,
         )
         if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
