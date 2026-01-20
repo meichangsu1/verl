@@ -10,6 +10,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   data.val_files=$HOME/data/multiturn/test.parquet \
   ++data.pad_mode=no_padding \
   data.micro_batch_size_per_gpu=1 \
+  data.ignore_input_ids_mismatch=true \
   model.path=/root/autodl-tmp/qwen3_moe_small  \
   model.use_remove_padding=true \
   ++model.speculator_adapter.fqn=verl.trainer.speculators.lstm_adapter.LSTMSpeculatorAdapter \
