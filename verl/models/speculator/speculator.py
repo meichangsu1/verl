@@ -302,6 +302,7 @@ class ArcticLSTMSpeculator(nn.Module):
                 actual_i = 0 if self.tie_weights else i
                 actual_proj_i = 1 if self.tie_weights and i >= 2 else i
 
+<<<<<<< HEAD
                 z = self.forget_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
                 state = self.forget_proj[actual_proj_i](prev_state)
                 forget_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
@@ -311,12 +312,31 @@ class ArcticLSTMSpeculator(nn.Module):
                 input_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
 
                 z = self.cell_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
+=======
+                # inds_index = torch.arange(i, i + state.size(1), device=inds.device)
+           
+                # inds_slice = inds.index_select(1, inds_index)
+                inds_slice=inds[:, i : i + state.size(1)]
+                z = self.forget_emb[actual_i](inds_slice)  # b n d
+                state = self.forget_proj[actual_proj_i](prev_state)
+                forget_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
+
+                z = self.input_emb[actual_i](inds_slice)  # b n d
+                state = self.input_proj[actual_proj_i](prev_state)
+                input_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
+
+                z = self.cell_emb[actual_i](inds_slice)  # b n d
+>>>>>>> mine/spec_general_meagtron
                 state = self.cell_proj[actual_proj_i](prev_state)
                 cell_candidate = torch.add(state, z, alpha=self.emb_weight / self.state_weight)
                 cell_candidate = self.activation(self.cell_ln[actual_i](cell_candidate))  # b n d
                 cell_candidate = cell_candidate * input_gate
 
+<<<<<<< HEAD
                 z = self.output_emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
+=======
+                z = self.output_emb[actual_i](inds_slice)  # b n d
+>>>>>>> mine/spec_general_meagtron
                 state = self.output_proj[actual_proj_i](prev_state)
                 output_gate = torch.sigmoid(torch.add(state, z, alpha=self.emb_weight / self.state_weight))
 
@@ -337,7 +357,13 @@ class ArcticLSTMSpeculator(nn.Module):
                 actual_i = 0 if self.tie_weights else i
                 actual_proj_i = 1 if self.tie_weights and i >= 2 else i
 
+<<<<<<< HEAD
                 z = self.emb[actual_i](inds[:, i : i + state.size(1)])  # b n d
+=======
+                inds_index = torch.arange(i, i + state.size(1), device=inds.device)
+                inds_slice = inds.index_select(1, inds_index)
+                z = self.emb[actual_i](inds_slice)  # b n d
+>>>>>>> mine/spec_general_meagtron
                 state = self.proj[actual_proj_i](state)
                 # Weighted add of state_weight*state and emb_weight*z
                 # Let subsequent LN take care of denominator

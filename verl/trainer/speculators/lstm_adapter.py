@@ -19,7 +19,11 @@ from torch import nn
 from verl.trainer.speculators.interface import SpeculatorAdapter
 import transformers
 from verl.trainer.speculators.config import SpeculatorConfigBase
+<<<<<<< HEAD
 
+=======
+import os
+>>>>>>> mine/spec_general_meagtron
 
 class ArcticLSTMSpeculatorConfig(SpeculatorConfigBase):
     """
@@ -73,7 +77,10 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         device_mesh,
         torch_dtype,
         speculator_config=None,
+<<<<<<< HEAD
         freeze_base_model=None,
+=======
+>>>>>>> mine/spec_general_meagtron
     ):
         self.config = config
         self.model_config = model_config
@@ -87,6 +94,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
             else:
                 speculator_config = getattr(self.model_config, "speculator", None)
         self.speculator_config = speculator_config
+<<<<<<< HEAD
         self.has_speculator = self.speculator_config is not None
 
         if freeze_base_model is None:
@@ -100,6 +108,13 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
 
     def build_and_attach(self, model, attach_to_model=True):
         if not self.has_speculator:
+=======
+
+        self.speculator = None
+
+    def build_speculator_module(self, model):
+        if self.speculator_config is None:
+>>>>>>> mine/spec_general_meagtron
             return None
 
         hf_config = self.model_config.hf_config if hasattr(self.model_config, "hf_config") else self.model_config
@@ -126,6 +141,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         else:
             config_obj = types.SimpleNamespace(**speculator_config_dict)
             self.speculator = speculator_mod.ArcticLSTMSpeculator(config_obj)
+<<<<<<< HEAD
         if attach_to_model:
             model.speculator = self.speculator
 
@@ -159,6 +175,24 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         return None
 
     def _get_speculator_config_obj(self, fsdp_model, speculator_module):
+=======
+
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in self.speculator.parameters():
+            param.requires_grad = True
+
+        self.speculator.to(device=self.device_name, dtype=self.torch_dtype)
+        self.speculator.reset_parameters()
+        if self.device_mesh.get_rank() == 0:
+            print(f"Created speculator with config: {speculator_config_dict}")
+
+        return self.speculator
+
+
+
+    def _get_speculator_config_obj(self, speculator_module):
+>>>>>>> mine/spec_general_meagtron
         if speculator_module is None:
             return None
         base_model_name_or_path = None
@@ -189,19 +223,34 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         loss_mask=None,
         hidden_states=None,
         spec_logits=None,
+<<<<<<< HEAD
     ):
         if not self.has_speculator:
             return torch.tensor(0.0, device=self.device_name)
 
         speculator_module = self._get_speculator_module(fsdp_model)
+=======
+        packed_seq_params=None,
+    ):
+        speculator_module = self._get_speculator_module()
+>>>>>>> mine/spec_general_meagtron
         if speculator_module is None:
             return torch.tensor(0.0, device=self.device_name)
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
+<<<<<<< HEAD
         input_ids = self._maybe_pad_nested(input_ids, padding=0)
         if loss_mask is not None:
             loss_mask = self._maybe_pad_nested(loss_mask, padding=0)
+=======
+        original_input_ids = input_ids
+        input_ids = self._maybe_pad_nested(input_ids, padding=0)
+        if loss_mask is not None:
+            loss_mask = self._maybe_pad_nested(loss_mask, padding=0)
+        if attention_mask is not None:
+            attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
+>>>>>>> mine/spec_general_meagtron
 
         if hidden_states is None:
             with torch.no_grad():
@@ -214,9 +263,20 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
                 )
                 hidden = hidden_out.hidden_states[-1]
         else:
+<<<<<<< HEAD
             hidden = self._maybe_pad_nested(hidden_states, padding=0.0)
         if spec_logits is None:
             spec_logits = self.compute_speculator_logits(fsdp_model, input_ids, hidden)
+=======
+            hidden = hidden_states
+        hidden = self._maybe_unpack_packed_hidden(original_input_ids, attention_mask, hidden, packed_seq_params)
+        hidden = self._maybe_pad_nested(hidden, padding=0.0)
+        spec_dtype = next(speculator_module.parameters()).dtype
+        if hidden.dtype != spec_dtype:
+            hidden = hidden.to(dtype=spec_dtype)
+        if spec_logits is None:
+            spec_logits = self.compute_speculator_logits(input_ids, hidden)
+>>>>>>> mine/spec_general_meagtron
 
         n_predict = speculator_module.n_predict
         vocab_size = spec_logits.size(-1)
@@ -246,12 +306,24 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         spec_loss = spec_loss_accum / n_predict
         return spec_loss
 
+<<<<<<< HEAD
     def compute_speculator_logits(self, fsdp_model, input_ids, hidden_states):
         speculator_module = self._get_speculator_module(fsdp_model)
+=======
+    def compute_speculator_logits(self, input_ids, hidden_states):
+        speculator_module = self._get_speculator_module()
+>>>>>>> mine/spec_general_meagtron
         if speculator_module is None:
             return None
 
         n_predict = speculator_module.n_predict
+<<<<<<< HEAD
+=======
+        if os.getenv("VERL_DEBUG_SPECULATOR") == "1":
+            print(
+                f"[debug][spec_logits] input_ids shape={tuple(input_ids.shape)} hidden shape={tuple(hidden_states.shape)}"
+            )
+>>>>>>> mine/spec_general_meagtron
         hidden, seq_ids = self._slice_speculator_inputs(input_ids, hidden_states, n_predict)
         pad_ids = torch.zeros(input_ids.size(0), n_predict, dtype=seq_ids.dtype, device=seq_ids.device)
         spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
