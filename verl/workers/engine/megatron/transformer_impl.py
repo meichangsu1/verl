@@ -784,11 +784,14 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         if not self.module:
             return
         last_stage = self.module[-1]
-        self.speculator = self.speculator_adapter.build_speculator_module(last_stage)
+        target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
+        self.speculator = self.speculator_adapter.build_speculator_module(target_stage)
         if self.speculator is not None:
             self.speculator_adapter.speculator = self.speculator
             # Register speculator on the last stage so optimizer can see its parameters.
             setattr(last_stage, "speculator", self.speculator)
+            if target_stage is not last_stage:
+                setattr(target_stage, "speculator", self.speculator)
         for module in self.module:
             for param in module.parameters():
                 param.requires_grad = False
