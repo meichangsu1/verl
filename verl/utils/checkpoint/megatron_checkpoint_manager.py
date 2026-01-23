@@ -313,7 +313,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 key = "model"
             if hasattr(model, "module"):
                 model = model.module
-            state_dict[key] = model.sharded_state_dict()
+            try:
+                state_dict[key] = model.sharded_state_dict(keep_vars=True)
+            except TypeError:
+                state_dict[key] = model.sharded_state_dict()
 
         # Optimizer State Dict
         if generate_optimizer:
