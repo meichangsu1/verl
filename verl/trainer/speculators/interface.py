@@ -96,6 +96,10 @@ class SpeculatorAdapter(ABC):
         attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
         if attention_mask is None:
             return hidden_states
+        if hidden_states.dim() == 3 and hidden_states.size(0) == attention_mask.size(1) and (
+            hidden_states.size(1) == attention_mask.size(0)
+        ):
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
         if hidden_states.dim() >= 2 and hidden_states.size(0) == attention_mask.size(0) and (
             hidden_states.size(1) == attention_mask.size(1)
         ):
