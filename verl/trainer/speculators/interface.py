@@ -84,7 +84,7 @@ class SpeculatorAdapter(ABC):
             batch_size, seq_len = input_ids.shape[:2]
         if batch_size is None or seq_len is None:
             return hidden_states
-        if hidden_states.size(0) == seq_len and hidden_states.size(1) == batch_size:
+        if hidden_states.size(1) == batch_size and hidden_states.size(0) != batch_size:
             return hidden_states.transpose(0, 1).contiguous()
         return hidden_states
 
