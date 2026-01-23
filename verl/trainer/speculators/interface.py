@@ -73,6 +73,21 @@ class SpeculatorAdapter(ABC):
             return torch.nested.to_padded_tensor(tensor, padding=padding)
         return tensor
 
+    def _maybe_normalize_hidden_layout(self, hidden_states, attention_mask, input_ids):
+        if hidden_states is None or not isinstance(hidden_states, torch.Tensor) or hidden_states.dim() != 3:
+            return hidden_states
+        batch_size = None
+        seq_len = None
+        if attention_mask is not None and attention_mask.dim() >= 2:
+            batch_size, seq_len = attention_mask.shape[:2]
+        elif input_ids is not None and isinstance(input_ids, torch.Tensor) and input_ids.dim() >= 2:
+            batch_size, seq_len = input_ids.shape[:2]
+        if batch_size is None or seq_len is None:
+            return hidden_states
+        if hidden_states.size(0) == seq_len and hidden_states.size(1) == batch_size:
+            return hidden_states.transpose(0, 1).contiguous()
+        return hidden_states
+
     def _maybe_unpack_packed_hidden(self, input_ids, attention_mask, hidden_states, packed_seq_params):
         if packed_seq_params is None or hidden_states is None:
             return hidden_states
@@ -96,10 +111,6 @@ class SpeculatorAdapter(ABC):
         attention_mask = self._maybe_pad_nested(attention_mask, padding=0)
         if attention_mask is None:
             return hidden_states
-        if hidden_states.dim() == 3 and hidden_states.size(0) == attention_mask.size(1) and (
-            hidden_states.size(1) == attention_mask.size(0)
-        ):
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
         if hidden_states.dim() >= 2 and hidden_states.size(0) == attention_mask.size(0) and (
             hidden_states.size(1) == attention_mask.size(1)
         ):

@@ -191,6 +191,7 @@ class LSTMSpeculatorAdapter(SpeculatorAdapter):
         else:
             hidden = hidden_states
         hidden = self._maybe_unpack_packed_hidden(original_input_ids, attention_mask, hidden, packed_seq_params)
+        hidden = self._maybe_normalize_hidden_layout(hidden, attention_mask, original_input_ids)
         hidden = self._maybe_pad_nested(hidden, padding=0.0)
         spec_dtype = next(speculator_module.parameters()).dtype
         if hidden.dtype != spec_dtype:
