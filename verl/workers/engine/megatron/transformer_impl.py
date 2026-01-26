@@ -235,9 +235,15 @@ class MegatronEngine(BaseEngine):
                 allowed_mismatched_params = []
                 if self.is_value_model:
                     allowed_mismatched_params = ["output_layer.weight"]
-                self.bridge.load_hf_weights(
-                    module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
-                )
+                try:
+                    self.bridge.load_hf_weights(
+                        module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+                    )
+                except TypeError:
+                    self.bridge.load_hf_weights(module, self.model_config.local_path)
+                except ValueError:
+                    # Older megatron-bridge may require hf_pretrained.state.source; fall back to vanilla loader.
+                    self.bridge.load_weights(module, self.model_config.local_path)
 
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
