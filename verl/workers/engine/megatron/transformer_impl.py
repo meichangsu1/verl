@@ -255,7 +255,9 @@ class MegatronEngine(BaseEngine):
 
                         def get_all_keys(self):
                             return self._keys
-                    pre_trained.state.source = _HFSource(pre_trained.state_dict().keys())
+                    source = getattr(pre_trained.state, "source", None)
+                    if not hasattr(source, "get_all_keys"):
+                        pre_trained.state.source = _HFSource(pre_trained.state_dict().keys())
                     self.bridge._model_bridge.load_weights_hf_to_megatron(
                         pre_trained, module, allowed_mismatched_params=allowed_mismatched_params
                     )
