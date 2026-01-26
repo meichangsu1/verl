@@ -213,6 +213,11 @@ def make_megatron_module(
                 from verl.trainer.speculators.interface import build_speculator_adapter
 
                 def speculator_pre_wrap_hook(model):
+                    if torch.distributed.get_rank() == 0:
+                        print(
+                            f"[debug][speculator] pre-wrap hook model={model.__class__.__name__} "
+                            f"post_process={getattr(model, 'post_process', None)}"
+                        )
                     nonlocal speculator_adapter
                     if not getattr(model, "post_process", False):
                         return model
@@ -232,6 +237,8 @@ def make_megatron_module(
                         speculator_module = speculator_adapter.build_speculator_module(model)
                         if speculator_module is not None:
                             setattr(model, "speculator", speculator_module)
+                            if torch.distributed.get_rank() == 0:
+                                print("[debug][speculator] attached speculator in pre-wrap hook")
                     return model
 
                 provider.register_pre_wrap_hook(speculator_pre_wrap_hook)
@@ -310,6 +317,11 @@ def make_megatron_module(
                     target = model
                     while hasattr(target, "module"):
                         target = target.module
+                    if torch.distributed.get_rank() == 0:
+                        print(
+                            f"[debug][speculator] post-create hook model={target.__class__.__name__} "
+                            f"post_process={getattr(target, 'post_process', None)}"
+                        )
                     if not getattr(target, "post_process", False):
                         return model
                     device_mesh = SimpleNamespace(get_rank=lambda: torch.distributed.get_rank())
@@ -329,6 +341,8 @@ def make_megatron_module(
                             setattr(target, "speculator", speculator_module)
                             if target is not model:
                                 setattr(model, "speculator", speculator_module)
+                            if torch.distributed.get_rank() == 0:
+                                print("[debug][speculator] attached speculator in post-create hook")
                     return model
 
                 post_model_creation_callbacks.append(speculator_post_creation_hook)
