@@ -257,7 +257,10 @@ class MegatronEngine(BaseEngine):
                             setattr(hf_pretrained.state, "source", "hf")
                             updated = True
                         if updated:
-                            self.bridge.load_hf_weights(module, self.model_config.local_path)
+                            try:
+                                self.bridge.load_hf_weights(module, self.model_config.local_path)
+                            except ValueError:
+                                self.bridge.load_weights(module, self.model_config.local_path)
                         else:
                             # Fall back when hf_pretrained doesn't expose state.
                             self.bridge.load_weights(module, self.model_config.local_path)
