@@ -245,11 +245,17 @@ class MegatronEngine(BaseEngine):
                     # Some megatron-bridge versions require hf_pretrained.state.source for weight ordering.
                     if "hf_pretrained.state.source" in str(exc):
                         hf_pretrained = getattr(self.bridge, "hf_pretrained", None)
-                        if hf_pretrained is not None and hasattr(hf_pretrained, "state"):
+                        if hf_pretrained is None:
+                            raise
+                        if isinstance(hf_pretrained, list):
+                            for item in hf_pretrained:
+                                if hasattr(item, "state"):
+                                    setattr(item.state, "source", "hf")
+                        elif hasattr(hf_pretrained, "state"):
                             setattr(hf_pretrained.state, "source", "hf")
-                            self.bridge.load_hf_weights(module, self.model_config.local_path)
                         else:
                             raise
+                        self.bridge.load_hf_weights(module, self.model_config.local_path)
                     else:
                         raise
 
