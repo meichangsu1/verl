@@ -237,7 +237,7 @@ class MegatronEngine(BaseEngine):
                     allowed_mismatched_params = ["output_layer.weight"]
                 try:
                     self.bridge.load_hf_weights(
-                        module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+                        module, self.model_config.local_path
                     )
                 except TypeError:
                     self.bridge.load_hf_weights(module, self.model_config.local_path)
@@ -247,15 +247,20 @@ class MegatronEngine(BaseEngine):
                         hf_pretrained = getattr(self.bridge, "hf_pretrained", None)
                         if hf_pretrained is None:
                             raise
+                        updated = False
                         if isinstance(hf_pretrained, list):
                             for item in hf_pretrained:
                                 if hasattr(item, "state"):
                                     setattr(item.state, "source", "hf")
+                                    updated = True
                         elif hasattr(hf_pretrained, "state"):
                             setattr(hf_pretrained.state, "source", "hf")
+                            updated = True
+                        if updated:
+                            self.bridge.load_hf_weights(module, self.model_config.local_path)
                         else:
-                            raise
-                        self.bridge.load_hf_weights(module, self.model_config.local_path)
+                            # Fall back when hf_pretrained doesn't expose state.
+                            self.bridge.load_weights(module, self.model_config.local_path)
                     else:
                         raise
 
