@@ -191,7 +191,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             return self.speculator_module
         if self.speculator_host_model is not None:
             target = self.speculator_host_model
-            if hasattr(target, "module"):
+            if callable(target) and hasattr(target, "__self__"):
+                target = target.__self__
+            # Unwrap common wrappers (DDP, Float16Module, etc.).
+            while hasattr(target, "module"):
                 target = target.module
             self.speculator_module = getattr(target, "speculator", None)
             if self.speculator_module is not None:

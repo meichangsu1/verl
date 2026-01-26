@@ -210,6 +210,17 @@ class MegatronEngine(BaseEngine):
             peft_config=self.model_config.get("lora", None),
             full_model_config=self.model_config,
         )
+        if (
+            getattr(self.model_config, "speculator", None) is not None
+            or getattr(self.model_config, "speculator_adapter", None) is not None
+        ):
+            last_stage = module[-1]
+            target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
+            if not hasattr(target_stage, "speculator"):
+                raise RuntimeError(
+                    "Speculator was not injected during model build. "
+                    "Ensure speculator config is set and pre-wrap hook ran before DDP."
+                )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
