@@ -213,6 +213,10 @@ def make_megatron_module(
                 from verl.trainer.speculators.interface import build_speculator_adapter
 
                 def speculator_pre_wrap_hook(model):
+                    if isinstance(model, list):
+                        for item in model:
+                            speculator_pre_wrap_hook(item)
+                        return model
                     if torch.distributed.get_rank() == 0:
                         print(
                             f"[debug][speculator] pre-wrap hook model={model.__class__.__name__} "
