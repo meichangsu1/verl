@@ -235,18 +235,6 @@ class MegatronEngine(BaseEngine):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, init_megatron_optim_config
 
         use_dist_opt = self.engine_config.use_distributed_optimizer
-        if self.has_speculator:
-            total_params = 0
-            trainable_params = 0
-            modules = self.module if isinstance(self.module, (list, tuple)) else [self.module]
-            for module in modules:
-                for p in module.parameters():
-                    total_params += p.numel()
-                    if p.requires_grad:
-                        trainable_params += p.numel()
-            if trainable_params > 0 and trainable_params < total_params:
-                # Speculator-only training can break distributed optimizer param mapping.
-                use_dist_opt = False
         optim_config_megatron = init_megatron_optim_config(
             self.optimizer_config,
             use_distributed_optimizer=use_dist_opt,
@@ -786,23 +774,9 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             return
         last_stage = self.module[-1]
         target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
-        existing_speculator = getattr(target_stage, "speculator", None)
-        if existing_speculator is not None:
-            self.speculator = existing_speculator
-        else:
-            self.speculator = self.speculator_adapter.build_speculator_module(target_stage)
+        self.speculator = getattr(target_stage, "speculator", None)
         if self.speculator is not None:
             self.speculator_adapter.speculator = self.speculator
-            # Register speculator on the last stage so optimizer can see its parameters.
-            setattr(last_stage, "speculator", self.speculator)
-            if target_stage is not last_stage:
-                setattr(target_stage, "speculator", self.speculator)
-        for module in self.module:
-            for param in module.parameters():
-                param.requires_grad = False
-        if self.speculator is not None:
-            for param in self.speculator.parameters():
-                param.requires_grad = True
 
     def _ensure_speculator_for_checkpoint(self):
         if self.speculator_adapter is None:
