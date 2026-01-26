@@ -300,6 +300,34 @@ def make_megatron_module(
             # Extract TransformerConfig from the created model
             tf_config = get_model_config(model[0] if isinstance(model, list) else model)
         else:
+            if full_model_config is not None and (
+                getattr(full_model_config, "speculator", None) is not None
+                or getattr(full_model_config, "speculator_adapter", None) is not None
+            ):
+                from verl.trainer.speculators.interface import build_speculator_adapter
+
+                def speculator_post_creation_hook(model):
+                    if not getattr(model, "post_process", False):
+                        return model
+                    device_mesh = SimpleNamespace(get_rank=lambda: torch.distributed.get_rank())
+                    params_dtype = getattr(tf_config, "params_dtype", None)
+                    if params_dtype is None:
+                        params_dtype = torch.bfloat16
+                    speculator_adapter = build_speculator_adapter(
+                        config=None,
+                        model_config=full_model_config,
+                        device_name=get_device_name(),
+                        device_mesh=device_mesh,
+                        torch_dtype=params_dtype,
+                    )
+                    if getattr(model, "speculator", None) is None:
+                        speculator_module = speculator_adapter.build_speculator_module(model)
+                        if speculator_module is not None:
+                            setattr(model, "speculator", speculator_module)
+                    return model
+
+                post_model_creation_callbacks.append(speculator_post_creation_hook)
+
             model = bridge.get_model(
                 post_model_creation_callbacks=post_model_creation_callbacks,
                 wrap_with_ddp=wrap_config.wrap_with_ddp,
