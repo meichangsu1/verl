@@ -249,7 +249,13 @@ class MegatronEngine(BaseEngine):
                     )
                     if not hasattr(pre_trained, "state"):
                         pre_trained.state = SimpleNamespace()
-                    pre_trained.state.source = "hf"
+                    class _HFSource:
+                        def __init__(self, keys):
+                            self._keys = list(keys)
+
+                        def get_all_keys(self):
+                            return self._keys
+                    pre_trained.state.source = _HFSource(pre_trained.state_dict().keys())
                     self.bridge._model_bridge.load_weights_hf_to_megatron(
                         pre_trained, module, allowed_mismatched_params=allowed_mismatched_params
                     )
