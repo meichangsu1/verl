@@ -208,6 +208,7 @@ class MegatronEngine(BaseEngine):
             override_ddp_config=self.engine_config.override_ddp_config,
             peft_cls=self.peft_cls,
             peft_config=self.model_config.get("lora", None),
+            full_model_config=self.model_config,
         )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
@@ -785,7 +786,11 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             return
         last_stage = self.module[-1]
         target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
-        self.speculator = self.speculator_adapter.build_speculator_module(target_stage)
+        existing_speculator = getattr(target_stage, "speculator", None)
+        if existing_speculator is not None:
+            self.speculator = existing_speculator
+        else:
+            self.speculator = self.speculator_adapter.build_speculator_module(target_stage)
         if self.speculator is not None:
             self.speculator_adapter.speculator = self.speculator
             # Register speculator on the last stage so optimizer can see its parameters.
