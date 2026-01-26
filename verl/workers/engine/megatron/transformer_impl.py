@@ -241,9 +241,17 @@ class MegatronEngine(BaseEngine):
                     )
                 except TypeError:
                     self.bridge.load_hf_weights(module, self.model_config.local_path)
-                except ValueError:
-                    # Older megatron-bridge may require hf_pretrained.state.source; fall back to vanilla loader.
-                    self.bridge.load_weights(module, self.model_config.local_path)
+                except ValueError as exc:
+                    # Some megatron-bridge versions require hf_pretrained.state.source for weight ordering.
+                    if "hf_pretrained.state.source" in str(exc):
+                        hf_pretrained = getattr(self.bridge, "hf_pretrained", None)
+                        if hf_pretrained is not None and hasattr(hf_pretrained, "state"):
+                            setattr(hf_pretrained.state, "source", "hf")
+                            self.bridge.load_hf_weights(module, self.model_config.local_path)
+                        else:
+                            raise
+                    else:
+                        raise
 
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
