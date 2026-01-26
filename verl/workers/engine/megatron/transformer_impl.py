@@ -244,25 +244,22 @@ class MegatronEngine(BaseEngine):
                 except ValueError as exc:
                     # Some megatron-bridge versions require hf_pretrained.state.source for weight ordering.
                     if "hf_pretrained.state.source" in str(exc):
-                        hf_pretrained = getattr(self.bridge, "hf_pretrained", None)
-                        if hf_pretrained is None:
-                            raise
-                        updated = False
-                        if isinstance(hf_pretrained, list):
-                            for item in hf_pretrained:
-                                if hasattr(item, "state"):
-                                    setattr(item.state, "source", "hf")
-                                    updated = True
-                        elif hasattr(hf_pretrained, "state"):
-                            setattr(hf_pretrained.state, "source", "hf")
-                            updated = True
-                        if updated:
-                            try:
-                                self.bridge.load_hf_weights(module, self.model_config.local_path)
-                            except ValueError:
-                                self.bridge.load_weights(module, self.model_config.local_path)
-                        else:
-                            # Fall back when hf_pretrained doesn't expose state.
+                        try:
+                            from types import SimpleNamespace
+
+                            from megatron.bridge.models.conversion.auto_bridge import PreTrainedCausalLM
+
+                            trust_remote_code = getattr(self.bridge.hf_pretrained, "trust_remote_code", False)
+                            pre_trained = PreTrainedCausalLM.from_pretrained(
+                                self.model_config.local_path, trust_remote_code=trust_remote_code
+                            )
+                            if not hasattr(pre_trained, "state"):
+                                pre_trained.state = SimpleNamespace()
+                            pre_trained.state.source = "hf"
+                            self.bridge._model_bridge.load_weights_hf_to_megatron(
+                                pre_trained, module, allowed_mismatched_params=allowed_mismatched_params
+                            )
+                        except Exception:
                             self.bridge.load_weights(module, self.model_config.local_path)
                     else:
                         raise
