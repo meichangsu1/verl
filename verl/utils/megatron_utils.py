@@ -306,8 +306,11 @@ def make_megatron_module(
             ):
                 from verl.trainer.speculators.interface import build_speculator_adapter
 
-                def speculator_post_creation_hook(model):
-                    if not getattr(model, "post_process", False):
+                def speculator_post_creation_hook(model, **_kwargs):
+                    target = model
+                    while hasattr(target, "module"):
+                        target = target.module
+                    if not getattr(target, "post_process", False):
                         return model
                     device_mesh = SimpleNamespace(get_rank=lambda: torch.distributed.get_rank())
                     params_dtype = getattr(tf_config, "params_dtype", None)
@@ -320,10 +323,12 @@ def make_megatron_module(
                         device_mesh=device_mesh,
                         torch_dtype=params_dtype,
                     )
-                    if getattr(model, "speculator", None) is None:
-                        speculator_module = speculator_adapter.build_speculator_module(model)
+                    if getattr(target, "speculator", None) is None:
+                        speculator_module = speculator_adapter.build_speculator_module(target)
                         if speculator_module is not None:
-                            setattr(model, "speculator", speculator_module)
+                            setattr(target, "speculator", speculator_module)
+                            if target is not model:
+                                setattr(model, "speculator", speculator_module)
                     return model
 
                 post_model_creation_callbacks.append(speculator_post_creation_hook)

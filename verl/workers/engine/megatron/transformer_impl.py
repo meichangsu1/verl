@@ -215,7 +215,9 @@ class MegatronEngine(BaseEngine):
             or getattr(self.model_config, "speculator_adapter", None) is not None
         ):
             last_stage = module[-1]
-            target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
+            target_stage = last_stage
+            while hasattr(target_stage, "module"):
+                target_stage = target_stage.module
             if not hasattr(target_stage, "speculator"):
                 raise RuntimeError(
                     "Speculator was not injected during model build. "
