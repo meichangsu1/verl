@@ -259,9 +259,27 @@ class MegatronEngine(BaseEngine):
                     source = getattr(pre_trained.state, "source", None)
                     if not hasattr(source, "get_all_keys"):
                         pre_trained.state.source = _HFSource(pre_trained.state_dict().keys())
-                    self.bridge._model_bridge.load_weights_hf_to_megatron(
-                        pre_trained, module, allowed_mismatched_params=allowed_mismatched_params
-                    )
+                    # Skip speculator params (newly added modules) when loading base HF weights.
+                    model_bridge = self.bridge._model_bridge
+                    orig_is_adapter = getattr(model_bridge, "_is_adapter_param_name", None)
+                    if (
+                        orig_is_adapter is not None
+                        and (
+                            getattr(self.model_config, "speculator", None) is not None
+                            or getattr(self.model_config, "speculator_adapter", None) is not None
+                        )
+                    ):
+                        def _is_adapter_with_speculator(param_name: str) -> bool:
+                            return orig_is_adapter(param_name) or param_name.startswith("speculator.") or ".speculator." in param_name
+
+                        model_bridge._is_adapter_param_name = _is_adapter_with_speculator
+                    try:
+                        model_bridge.load_weights_hf_to_megatron(
+                            pre_trained, module, allowed_mismatched_params=allowed_mismatched_params
+                        )
+                    finally:
+                        if orig_is_adapter is not None:
+                            model_bridge._is_adapter_param_name = orig_is_adapter
                 else:
                     self.bridge.load_hf_weights(module, self.model_config.local_path)
 
