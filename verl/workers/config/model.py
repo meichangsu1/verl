@@ -24,48 +24,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
-
-
-@dataclass
-class MtpConfig(BaseConfig):
-    """
-    Configuration for MTP model.
-
-    enable: Enable loading and saving of MTP parameters, but do not use them
-
-    enable_train: Whether to enable using MTP parameters during training
-    enable_rollout: Whether to enable using MTP parameters during rollout
-
-    Training parameters:
-        detach_encoder: Whether to detach encoder parameters during MTP training
-        mtp_loss_scaling_factor: Loss scaling factor during MTP training
-
-    vLLM rollout parameters:
-        method: "mtp"
-        num-speculative-tokens: 1
-
-    SGLang rollout parameters:
-        speculative-algorithm: EAGLE
-        speculative-num-steps: 2
-        speculative-eagle-topk: 2
-        speculative-num-draft-tokens: [value]
-    """
-
-    enable: bool = False
-    enable_train: bool = False
-    enable_rollout: bool = False
-
-    detach_encoder: bool = False
-    mtp_loss_scaling_factor: float = 0.1
-
-    speculative_algorithm: str = "EAGLE"
-    speculative_num_steps: int = 2
-    speculative_eagle_topk: int = 2
-    speculative_num_draft_tokens: int = 4
-
-    method: str = "mtp"
-    num_speculative_tokens: int = 1
+__all__ = ["HFModelConfig"]
 
 
 @dataclass
@@ -115,6 +74,12 @@ class HFModelConfig(BaseConfig):
 
     use_remove_padding: bool = True
 
+    # speculator config for speculative decoding training
+    speculator: Optional[dict[str, Any]] = None
+
+    # custom speculator adapter config
+    speculator_adapter: Optional[dict[str, Any]] = None
+
     # TODO: unify fsdp and megatron lora config
     # fsdp lora related. We may setup a separate config later
     lora_rank: int = 0
@@ -137,8 +102,6 @@ class HFModelConfig(BaseConfig):
     tiled_mlp: dict = field(default_factory=lambda: {"enabled": False, "num_shards": 4})
 
     architectures: Optional[list[str]] = None
-
-    mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
