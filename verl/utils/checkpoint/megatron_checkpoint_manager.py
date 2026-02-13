@@ -340,6 +340,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         state_dict: dict[str, Any],
         local_path: str,
         dist_checkpoint_path: str,
+        primary_include_speculator_state: bool,
     ) -> dict[str, Any]:
         """Load optimizer state with backward-compatible speculator layout fallback."""
         assert "optimizer" in state_dict, (
@@ -353,9 +354,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         except RuntimeError as e:
             if self.speculator_module is None:
                 raise
+            secondary_include_speculator_state = not primary_include_speculator_state
             log_with_rank(
-                "Optimizer state load failed with speculator-aware layout; retrying with legacy layout "
-                "(without injected speculator state for optimizer mapping).",
+                "Optimizer state load failed; retrying with alternate speculator layout "
+                f"(primary include_speculator_state={primary_include_speculator_state}, "
+                f"secondary include_speculator_state={secondary_include_speculator_state}).",
                 rank=self.rank,
                 logger=logger,
             )
@@ -365,7 +368,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 self.should_load_optimizer,
                 False,
                 is_loading=True,
-                include_speculator_state=False,
+                include_speculator_state=secondary_include_speculator_state,
             )
             legacy_state_dict = load_dist_checkpointing(
                 sharded_state_dict=legacy_sharded_state_dict,
@@ -375,13 +378,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 self.optimizer.load_state_dict(legacy_state_dict["optimizer"])
             except Exception as legacy_e:
                 raise RuntimeError(
-                    "Failed to load optimizer state in both speculator-aware and legacy layouts. "
+                    "Failed to load optimizer state in both speculator layouts. "
                     "If this checkpoint was produced with different model/speculator settings, "
                     "resume with checkpoint.load_contents=['model','extra']."
                 ) from legacy_e
 
             log_with_rank(
-                f"Loaded optimizer checkpoint from {local_path} via legacy speculator layout fallback "
+                f"Loaded optimizer checkpoint from {local_path} via speculator layout fallback "
                 f"(original error: {e})",
                 rank=self.rank,
                 logger=logger,
@@ -421,12 +424,17 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
 
+        # In HF-checkpoint mode (use_dist_checkpointing=False), optimizer state should not depend on
+        # ad-hoc speculator injection into model state_dict. Keep mapping stable by excluding it.
+        include_speculator_for_sharded_mapping = self.should_load_model and self.use_dist_checkpointing
+
         # Get State Dict for loading
         sharded_state_dict = self.generate_state_dict(
             self.should_load_model and self.use_dist_checkpointing,
             self.should_load_optimizer,
             self.should_load_extra,
             is_loading=True,
+            include_speculator_state=include_speculator_for_sharded_mapping,
         )
         log_with_rank(f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=self.rank, logger=logger)
 
@@ -501,6 +509,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 state_dict=state_dict,
                 local_path=local_path,
                 dist_checkpoint_path=dist_checkpoint_path,
+                primary_include_speculator_state=include_speculator_for_sharded_mapping,
             )
             if self.use_checkpoint_opt_param_scheduler:
                 assert "lr_scheduler" in optimizer_loaded_state_dict, (
@@ -570,11 +579,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 torch.distributed.barrier()
         else:
             assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
+            # In HF-checkpoint mode, speculator is saved separately under local_path/speculator.
+            # Exclude speculator from optimizer sharded-state mapping to keep optimizer checkpoint layout stable.
             # Generate optimizer and exra state dicts
             state_dict = self.generate_state_dict(
                 generate_model=False,
                 generate_optimizer=self.should_save_optimizer,
                 generate_extra=self.should_save_extra,
+                include_speculator_state=False,
             )
             # Save optimizer and extra states to local path
             # Start Async save if enabled
