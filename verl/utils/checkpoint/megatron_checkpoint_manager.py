@@ -286,6 +286,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         generate_optimizer: bool = True,
         generate_extra: bool = True,
         is_loading: bool = False,
+        include_speculator_state: bool = True,
     ):
         # For save dist checkpointing
         state_dict = {}
@@ -305,7 +306,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 state_dict[key] = model.sharded_state_dict(keep_vars=True)
             except TypeError:
                 state_dict[key] = model.sharded_state_dict()
-            if self.speculator_module is not None and vpp_rank == len(self.model) - 1:
+            if include_speculator_state and self.speculator_module is not None and vpp_rank == len(self.model) - 1:
                 if "speculator" not in state_dict[key]:
                     try:
                         spec_state = self.speculator_module.state_dict(keep_vars=True)
@@ -333,6 +334,59 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             state_dict["rng_state"] = rng_state
 
         return state_dict
+
+    def _load_optimizer_state_with_speculator_fallback(
+        self,
+        state_dict: dict[str, Any],
+        local_path: str,
+        dist_checkpoint_path: str,
+    ) -> dict[str, Any]:
+        """Load optimizer state with backward-compatible speculator layout fallback."""
+        assert "optimizer" in state_dict, (
+            f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
+        )
+
+        try:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
+            log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
+            return state_dict
+        except RuntimeError as e:
+            if self.speculator_module is None:
+                raise
+            log_with_rank(
+                "Optimizer state load failed with speculator-aware layout; retrying with legacy layout "
+                "(without injected speculator state for optimizer mapping).",
+                rank=self.rank,
+                logger=logger,
+            )
+
+            legacy_sharded_state_dict = self.generate_state_dict(
+                self.should_load_model and self.use_dist_checkpointing,
+                self.should_load_optimizer,
+                False,
+                is_loading=True,
+                include_speculator_state=False,
+            )
+            legacy_state_dict = load_dist_checkpointing(
+                sharded_state_dict=legacy_sharded_state_dict,
+                ckpt_dir=dist_checkpoint_path,
+            )
+            try:
+                self.optimizer.load_state_dict(legacy_state_dict["optimizer"])
+            except Exception as legacy_e:
+                raise RuntimeError(
+                    "Failed to load optimizer state in both speculator-aware and legacy layouts. "
+                    "If this checkpoint was produced with different model/speculator settings, "
+                    "resume with checkpoint.load_contents=['model','extra']."
+                ) from legacy_e
+
+            log_with_rank(
+                f"Loaded optimizer checkpoint from {local_path} via legacy speculator layout fallback "
+                f"(original error: {e})",
+                rank=self.rank,
+                logger=logger,
+            )
+            return legacy_state_dict
 
     def load_rng_states(self, rng_states, data_parallel_random_init=False, use_dist_ckpt=True):
         # access rng_state for data parallel rank
@@ -441,19 +495,20 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     logger=logger,
                 )
 
+        optimizer_loaded_state_dict = state_dict
         if self.should_load_optimizer:
-            assert "optimizer" in state_dict, (
-                f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
+            optimizer_loaded_state_dict = self._load_optimizer_state_with_speculator_fallback(
+                state_dict=state_dict,
+                local_path=local_path,
+                dist_checkpoint_path=dist_checkpoint_path,
             )
-            optimizer_state_dict = state_dict["optimizer"]
-            self.optimizer.load_state_dict(optimizer_state_dict)
-            log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
             if self.use_checkpoint_opt_param_scheduler:
-                assert "lr_scheduler" in state_dict, (
-                    f"LR scheduler state dict not found in {state_dict.keys()}. Please check the checkpoint file "
+                assert "lr_scheduler" in optimizer_loaded_state_dict, (
+                    f"LR scheduler state dict not found in {optimizer_loaded_state_dict.keys()}. "
+                    f"Please check the checkpoint file "
                     f"{local_path}."
                 )
-                lr_scheduler_state_dict = state_dict["lr_scheduler"]
+                lr_scheduler_state_dict = optimizer_loaded_state_dict["lr_scheduler"]
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
                     log_with_rank(f"Loaded LR scheduler checkpoint from {local_path}", rank=self.rank, logger=logger)
