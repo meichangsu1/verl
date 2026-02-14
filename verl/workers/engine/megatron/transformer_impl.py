@@ -165,6 +165,16 @@ class MegatronEngine(BaseEngine):
         if not self.bridge:
             self.weight_converter = get_mcore_weight_converter(self.model_config.hf_config, self.dtype)
 
+        has_speculator_cfg = (
+            getattr(self.model_config, "speculator", None) is not None
+            or getattr(self.model_config, "speculator_adapter", None) is not None
+        )
+        if has_speculator_cfg and self.vanilla_bridge:
+            raise RuntimeError(
+                "Speculator on Megatron backend requires engine.vanilla_mbridge=False. "
+                "Current config has vanilla_mbridge=True, so speculator pre-wrap injection cannot run."
+            )
+
         if torch.distributed.get_rank() == 0:
             if tf_config is not None:
                 print(f"TF config: {tf_config}")
@@ -220,9 +230,15 @@ class MegatronEngine(BaseEngine):
             while hasattr(target_stage, "module"):
                 target_stage = target_stage.module
             if not hasattr(target_stage, "speculator"):
+                hint = []
+                if self.vanilla_bridge:
+                    hint.append("set engine.vanilla_mbridge=False")
+                if getattr(self.model_config, "speculator_adapter", None) is None:
+                    hint.append("set model.speculator_adapter.fqn=<your_adapter_fqn>")
                 raise RuntimeError(
                     "Speculator was not injected during model build. "
-                    "Ensure speculator config is set and pre-wrap hook ran before DDP."
+                    "Ensure speculator config is set and pre-wrap hook ran before DDP. "
+                    + ("Suggested fix: " + ", ".join(hint) if hint else "")
                 )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
