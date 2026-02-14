@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import hashlib
 from collections.abc import Callable
 from typing import Any, Optional
 from dataclasses import asdict
@@ -234,6 +235,23 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         return rng_state_list
 
+    def _get_trainable_param_signature(self) -> tuple[int, int, str]:
+        """Return a deterministic signature for current trainable parameters."""
+        digest = hashlib.sha1()
+        trainable_count = 0
+        trainable_numel = 0
+        for vpp_rank, model in enumerate(self.model):
+            target = model
+            while hasattr(target, "module"):
+                target = target.module
+            for name, param in target.named_parameters():
+                if not param.requires_grad:
+                    continue
+                trainable_count += 1
+                trainable_numel += param.numel()
+                digest.update(f"{vpp_rank}:{name}:{tuple(param.shape)}".encode("utf-8"))
+        return trainable_count, trainable_numel, digest.hexdigest()
+
     def get_checkpoint_name(
         self,
         checkpoints_path,
@@ -423,6 +441,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             pass
 
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
+        if self.should_load_optimizer:
+            trainable_count, trainable_numel, trainable_hash = self._get_trainable_param_signature()
+            log_with_rank(
+                f"Optimizer load signature: trainable_count={trainable_count}, "
+                f"trainable_numel={trainable_numel}, hash={trainable_hash}",
+                rank=self.rank,
+                logger=logger,
+            )
 
         # In HF-checkpoint mode (use_dist_checkpointing=False), optimizer state should not depend on
         # ad-hoc speculator injection into model state_dict. Keep mapping stable by excluding it.
@@ -549,6 +575,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         local_path = local_mkdir_safe(local_path)
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
+        if self.should_save_optimizer:
+            trainable_count, trainable_numel, trainable_hash = self._get_trainable_param_signature()
+            log_with_rank(
+                f"Optimizer save signature: trainable_count={trainable_count}, "
+                f"trainable_numel={trainable_numel}, hash={trainable_hash}",
+                rank=self.rank,
+                logger=logger,
+            )
 
         # Note that model weights, optimizer states, and extra states are generated
         # together in a state dict, we save them in one time
