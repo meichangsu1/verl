@@ -225,11 +225,17 @@ class MegatronEngine(BaseEngine):
             getattr(self.model_config, "speculator", None) is not None
             or getattr(self.model_config, "speculator_adapter", None) is not None
         ):
-            last_stage = module[-1]
-            target_stage = last_stage
-            while hasattr(target_stage, "module"):
-                target_stage = target_stage.module
-            if not hasattr(target_stage, "speculator"):
+            # Speculator is attached only to post_process stage(s), which may not
+            # exist on every pipeline rank. Validate only where post_process is local.
+            post_process_stage = None
+            for model_chunk in module:
+                target_stage = model_chunk
+                while hasattr(target_stage, "module"):
+                    target_stage = target_stage.module
+                if getattr(target_stage, "post_process", False):
+                    post_process_stage = target_stage
+                    break
+            if post_process_stage is not None and not hasattr(post_process_stage, "speculator"):
                 hint = []
                 if self.vanilla_bridge:
                     hint.append("set engine.vanilla_mbridge=False")
@@ -820,9 +826,14 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             return
         if not self.module:
             return
-        last_stage = self.module[-1]
-        target_stage = last_stage.module if hasattr(last_stage, "module") else last_stage
-        self.speculator = getattr(target_stage.module, "speculator", None)
+        self.speculator = None
+        for model_chunk in self.module:
+            target_stage = model_chunk
+            while hasattr(target_stage, "module"):
+                target_stage = target_stage.module
+            if getattr(target_stage, "post_process", False):
+                self.speculator = getattr(target_stage, "speculator", None)
+                break
         if self.speculator is not None:
             self.speculator_adapter.speculator = self.speculator
 
