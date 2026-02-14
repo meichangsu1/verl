@@ -289,6 +289,7 @@ def gptmodel_forward_no_padding_with_hidden(
 ):
     """Forward pass that returns hidden states without running post_process/logits."""
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
+    post_process = unwrap_model(model).post_process
     with _disable_post_process(model):
         output, packed_seq_params = gptmodel_forward_no_padding(
             model,
@@ -302,6 +303,9 @@ def gptmodel_forward_no_padding_with_hidden(
             data_format=data_format,
             return_packed_seq_params=True,
         )
+    # For non-last PP stages, pipeline P2P expects a tensor (not dict).
+    if not post_process:
+        return output
     if data_format == "thd" and isinstance(output, torch.Tensor):
         if output.dim() == 2:
             output = output.unsqueeze(0)
@@ -328,6 +332,7 @@ def model_forward_with_hidden(
 ):
     """Forward pass that returns hidden states with padding inputs."""
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
+    post_process = unwrap_model(model).post_process
     pre_process = unwrap_model(model).pre_process if not vision_model else False
     sp = unwrap_model(model).config.sequence_parallel
     fp8 = unwrap_model(model).config.fp8
@@ -361,6 +366,8 @@ def model_forward_with_hidden(
                 input_args["input_ids"] = input_ids
                 input_args["attention_mask"] = attention_mask
             output_orig = model(**input_args)
+            if not post_process:
+                return output_orig
             output = postprocess_packed_seqs(
                 output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
             )
@@ -376,6 +383,8 @@ def model_forward_with_hidden(
                 position_ids=new_position_ids,
                 **model_kwargs,
             )
+            if not post_process:
+                return output_orig
             output = postprocess_bshd(
                 output_orig, new_attention_mask, attention_mask, seq_len, post_process=True
             )
