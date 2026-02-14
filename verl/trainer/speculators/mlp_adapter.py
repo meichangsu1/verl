@@ -158,12 +158,24 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
             targets = input_ids[:, start : start + max_len]
 
             logits_i = spec_logits[i][:, :max_len, :].reshape(-1, vocab_size)
-            labels_i = targets.reshape(-1)
+            labels_i = targets.reshape(-1).to(dtype=torch.long)
+            mask_i = loss_mask_matrix[:, start : start + max_len].reshape(-1).to(dtype=torch.bool)
+            if not torch.any(mask_i):
+                continue
 
-            ce_i = loss_fct(logits_i, labels_i)
-            mask_i = loss_mask_matrix[:, start : start + max_len].reshape(-1)
-            ce_i = ce_i * mask_i
-            spec_loss_accum += ce_i.sum() / mask_i.sum().clamp(min=1)
+            valid_logits = logits_i[mask_i]
+            valid_labels = labels_i[mask_i]
+            if torch.any(valid_labels < 0) or torch.any(valid_labels >= vocab_size):
+                min_label = int(valid_labels.min().item())
+                max_label = int(valid_labels.max().item())
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                raise RuntimeError(
+                    f"[rank{rank}] Invalid target id for speculator CE: min={min_label}, "
+                    f"max={max_label}, vocab_size={vocab_size}."
+                )
+
+            ce_i = loss_fct(valid_logits, valid_labels)
+            spec_loss_accum += ce_i.mean()
 
         spec_loss = spec_loss_accum / n_predict
         return spec_loss
@@ -183,6 +195,14 @@ class MLPSpeculatorAdapter(SpeculatorAdapter):
         hidden, seq_ids = self._slice_speculator_inputs(input_ids, hidden_states, n_predict)
         pad_ids = torch.zeros(input_ids.size(0), n_predict, dtype=seq_ids.dtype, device=seq_ids.device)
         spec_inds = torch.cat([seq_ids, pad_ids], dim=1)
+        if torch.any(spec_inds < 0) or torch.any(spec_inds >= speculator_module.vocab_size):
+            min_idx = int(spec_inds.min().item())
+            max_idx = int(spec_inds.max().item())
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            raise RuntimeError(
+                f"[rank{rank}] Invalid input id for speculator embedding: "
+                f"min={min_idx}, max={max_idx}, vocab_size={speculator_module.vocab_size}."
+            )
 
         spec_logits = speculator_module(hidden, spec_inds)
         return spec_logits
