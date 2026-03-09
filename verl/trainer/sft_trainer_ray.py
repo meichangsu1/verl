@@ -109,9 +109,15 @@ class SFTTrainer:
         from verl.workers.utils.losses import sft_loss
 
         self.loss_fn = partial(sft_loss, config=None)
+        spec_decode_enabled = getattr(self.model_config, "spec_decode", None) is not None
+        if spec_decode_enabled and str(self.engine_config.strategy).lower() != "megatron":
+            raise NotImplementedError(
+                "model.spec_decode currently only supports engine.strategy=megatron in this branch."
+            )
+        model_type = "language_model_with_speculator" if spec_decode_enabled else "language_model"
 
         config = TrainingWorkerConfig(
-            model_type="language_model",
+            model_type=model_type,
             model_config=self.model_config,
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,

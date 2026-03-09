@@ -33,6 +33,8 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
+from verl.trainer.speculators.engine_helpers import build_engine_spec_decode_bundle, resolve_spec_decode_config
+from verl.trainer.speculators.strategy_interface import LossOutput, TargetRuntimeView
 from verl.utils import tensordict_utils as tu
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -1036,6 +1038,67 @@ class FSDPEngineWithLMHead(FSDPEngine):
             }
 
             return loss, output
+
+
+@EngineRegistry.register(model_type="language_model_with_speculator", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+class FSDPEngineWithLMHeadAndSpeculator(FSDPEngineWithLMHead):
+    """
+    Spec decode engine skeleton for the FSDP backend.
+
+    NOTE:
+    This class intentionally contains interface-only placeholders in this branch.
+    """
+
+    def __init__(
+        self,
+        model_config: HFModelConfig,
+        engine_config: FSDPEngineConfig,
+        optimizer_config: FSDPOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
+        super().__init__(
+            model_config=model_config,
+            engine_config=engine_config,
+            optimizer_config=optimizer_config,
+            checkpoint_config=checkpoint_config,
+        )
+        self.spec_decode_cfg = resolve_spec_decode_config(self.model_config, require=False)
+        self.spec_decode_strategy = None
+        self.spec_decode_runtime_ctx = None
+
+    def initialize(self):
+        self._bootstrap_spec_decode()
+        raise NotImplementedError("Interface skeleton only: FSDP spec decode initialize logic is intentionally empty.")
+
+    def _bootstrap_spec_decode(self) -> None:
+        runtime_dtype = self.engine_config.model_dtype
+        if not isinstance(runtime_dtype, torch.dtype):
+            runtime_dtype = torch.float32
+        bundle = build_engine_spec_decode_bundle(
+            model_config=self.model_config,
+            backend="fsdp",
+            torch_dtype=runtime_dtype,
+            supports_packed_seq=False,
+            require=True,
+        )
+        self.spec_decode_cfg = bundle.config
+        self.spec_decode_strategy = bundle.strategy
+        self.spec_decode_runtime_ctx = bundle.runtime_context
+
+    def _build_target_runtime_view(self, micro_batch: TensorDict, raw_output) -> TargetRuntimeView:
+        del micro_batch, raw_output
+        raise NotImplementedError(
+            "Interface skeleton only: FSDP target runtime view build logic is intentionally empty. "
+            "The runtime view must populate labels, defaulting to input_ids when explicit labels are absent."
+        )
+
+    def _compute_spec_decode_loss(self, target_view: TargetRuntimeView) -> LossOutput:
+        del target_view
+        raise NotImplementedError("Interface skeleton only: FSDP spec decode loss logic is intentionally empty.")
+
+    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        del micro_batch, loss_function, forward_only
+        raise NotImplementedError("Interface skeleton only: FSDP spec decode forward step logic is intentionally empty.")
 
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

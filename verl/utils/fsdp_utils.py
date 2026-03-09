@@ -56,6 +56,39 @@ def init_fn(x: torch.nn.Module):
     return x
 
 
+def unwrap_model(model):
+    """Unwrap common FSDP wrappers and return the innermost module."""
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+
+    unwrapped_model = []
+    for model_module in model:
+        visited: set[int] = set()
+        while isinstance(model_module, nn.Module):
+            module_id = id(model_module)
+            if module_id in visited:
+                break
+            visited.add(module_id)
+
+            next_module = None
+            for attr_name in ("_fsdp_wrapped_module", "_orig_mod", "module"):
+                candidate = getattr(model_module, attr_name, None)
+                if isinstance(candidate, nn.Module):
+                    next_module = candidate
+                    break
+            if next_module is None:
+                break
+            model_module = next_module
+
+        unwrapped_model.append(model_module)
+
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
+
+
 def get_init_weight_context_manager(use_meta_tensor=True, mesh: DeviceMesh = None):
     from accelerate import init_empty_weights
 

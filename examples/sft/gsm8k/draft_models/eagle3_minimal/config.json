@@ -1,0 +1,14 @@
+{
+  "model_type": "eagle3_draft",
+  "vocab_size": 151936,
+  "hidden_size": 4096,
+  "intermediate_size": 11008,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 32,
+  "rms_norm_eps": 1e-6,
+  "aux_hidden_layers": [1, 15, 28],
+  "reference_trust_remote_code": false,
+  "freeze_reference_embed_tokens": false,
+  "freeze_reference_lm_head": false,
+  "pad_token_id": 0
+}
