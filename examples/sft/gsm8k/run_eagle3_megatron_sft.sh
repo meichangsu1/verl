@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-if [ "$#" -lt 3 ]; then
-    echo "Usage: run_eagle3_megatron_sft.sh <nproc_per_node> <save_path> <draft_model_dir> [extra_hydra_overrides...]"
+if [ "$#" -lt 2 ]; then
+    echo "Usage: run_eagle3_megatron_sft.sh <nproc_per_node> <save_path> [draft_model_dir] [extra_hydra_overrides...]"
     exit 1
 fi
 
 NPROC_PER_NODE=$1
 SAVE_PATH=$2
-DRAFT_DIR=$3
-shift 3
+shift 2
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_DRAFT_DIR="$SCRIPT_DIR/draft_models/eagle3_minimal"
+
+if [ "$#" -gt 0 ] && [ -d "$1" ]; then
+    DRAFT_DIR=$1
+    shift 1
+else
+    DRAFT_DIR=$DEFAULT_DRAFT_DIR
+fi
 
 if [ ! -d "$DRAFT_DIR" ]; then
     echo "draft_model_dir does not exist: $DRAFT_DIR"
@@ -48,6 +57,19 @@ TTT_STEPS=${TTT_STEPS:-1}
 AUX_HIDDEN_LAYERS=${AUX_HIDDEN_LAYERS:-"[1,-2,-1]"}
 REUSE_TARGET_LM_HEAD=${REUSE_TARGET_LM_HEAD:-false}
 
+# mbridge currently expects hf_config.rope_theta for GPT-style models.
+# Some Qwen3 configs in older transformers builds may not expose it.
+SET_ROPE_THETA=${SET_ROPE_THETA:-auto}
+ROPE_THETA=${ROPE_THETA:-1000000}
+EXTRA_MODEL_OVERRIDES=()
+if [ "$SET_ROPE_THETA" = "true" ]; then
+    EXTRA_MODEL_OVERRIDES+=(++model.override_config.rope_theta="$ROPE_THETA")
+elif [ "$SET_ROPE_THETA" = "auto" ]; then
+    if [[ "$MODEL_PATH" == *"Qwen3"* || "$MODEL_PATH" == *"qwen3"* ]]; then
+        EXTRA_MODEL_OVERRIDES+=(++model.override_config.rope_theta="$ROPE_THETA")
+    fi
+fi
+
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     -m verl.trainer.sft_trainer \
     engine=megatron \
@@ -65,13 +87,14 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     model.path="$MODEL_PATH" \
     model.trust_remote_code=true \
     model.use_remove_padding=true \
-    model.spec_decode.strategy.name=eagle3 \
-    model.spec_decode.draft_model.path="$DRAFT_DIR" \
-    model.spec_decode.draft_model.init="$DRAFT_INIT" \
-    model.spec_decode.draft_model.trust_remote_code="$DRAFT_TRUST_REMOTE_CODE" \
-    model.spec_decode.strategy_config.ttt_steps="$TTT_STEPS" \
-    model.spec_decode.strategy_config.aux_hidden_layers="$AUX_HIDDEN_LAYERS" \
-    model.spec_decode.strategy_config.reuse_target_lm_head="$REUSE_TARGET_LM_HEAD" \
+    "${EXTRA_MODEL_OVERRIDES[@]}" \
+    ++model.spec_decode.strategy.name=eagle3 \
+    ++model.spec_decode.draft_model.path="$DRAFT_DIR" \
+    ++model.spec_decode.draft_model.init="$DRAFT_INIT" \
+    ++model.spec_decode.draft_model.trust_remote_code="$DRAFT_TRUST_REMOTE_CODE" \
+    ++model.spec_decode.strategy_config.ttt_steps="$TTT_STEPS" \
+    ++model.spec_decode.strategy_config.aux_hidden_layers="$AUX_HIDDEN_LAYERS" \
+    ++model.spec_decode.strategy_config.reuse_target_lm_head="$REUSE_TARGET_LM_HEAD" \
     engine.tensor_model_parallel_size="$TP_SIZE" \
     engine.pipeline_model_parallel_size="$PP_SIZE" \
     engine.virtual_pipeline_model_parallel_size="$VPP_SIZE" \

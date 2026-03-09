@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import copy
 from typing import Any, Optional
 
 import torch
@@ -186,35 +185,34 @@ class TemplateSpecDecodeStrategy(BaseSpecDecodeStrategy):
         del target_model, strategy_cfg
         spec = self._resolve_draft_model_spec()
 
-        target_cfg = getattr(self._unwrap_model(self.target_model), "config", None)
-        target_cfg_copy = copy.deepcopy(target_cfg) if target_cfg is not None else None
-
         if spec.init == "pretrained":
-            base_config = None if spec.path else target_cfg_copy
+            if not spec.path:
+                raise ValueError(
+                    "draft_model.init=pretrained requires model.spec_decode.draft_model.path "
+                    "when target-model config fallback is disabled."
+                )
             model = AutoDraftModel.from_pretrained(
                 spec.path,
                 trust_remote_code=spec.trust_remote_code,
                 torch_dtype=self.runtime_ctx.torch_dtype,
-                config=base_config,
             )
         elif spec.init == "from_config":
-            AutoDraftModel.maybe_load_local_plugins(spec.path)
-            draft_config = None
-            if spec.path:
-                try:
-                    draft_config = AutoConfig.from_pretrained(spec.path, trust_remote_code=spec.trust_remote_code)
-                except Exception:
-                    draft_config = None
-            if draft_config is None:
-                draft_config = target_cfg_copy
-            if draft_config is None:
+            if not spec.path:
                 raise ValueError(
-                    "draft_model.init=from_config requires either a valid draft_model.path config "
-                    "or a target model config for fallback initialization."
+                    "draft_model.init=from_config requires model.spec_decode.draft_model.path "
+                    "when target-model config fallback is disabled."
                 )
+            AutoDraftModel.maybe_load_local_plugins(spec.path)
+            try:
+                draft_config = AutoConfig.from_pretrained(spec.path, trust_remote_code=spec.trust_remote_code)
+            except Exception as exc:
+                raise ValueError(
+                    "draft_model.init=from_config failed to load config from "
+                    f"model.spec_decode.draft_model.path={spec.path!r}."
+                ) from exc
             explicit_reference_path = self._normalize_path(getattr(draft_config, "reference_model_path", None))
             if explicit_reference_path is None:
-                target_model_path = self._resolve_target_model_path(target_cfg_copy)
+                target_model_path = self._resolve_target_model_path(target_config=None)
                 if target_model_path is not None:
                     setattr(draft_config, "reference_model_path", target_model_path)
             model = AutoDraftModel.from_config(
