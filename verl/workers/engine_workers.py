@@ -508,8 +508,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if "actor" in self.role:
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
+            spec_decode_enabled = getattr(actor_config.model_config, "spec_decode", None) is not None
+            actor_model_type = "language_model_with_speculator" if spec_decode_enabled else "language_model"
             actor_training_config = TrainingWorkerConfig(
-                model_type="language_model",
+                model_type=actor_model_type,
                 model_config=actor_config.model_config,
                 engine_config=actor_config.engine,
                 optimizer_config=actor_config.optim,

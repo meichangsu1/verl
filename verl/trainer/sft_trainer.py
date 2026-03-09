@@ -351,7 +351,7 @@ class SFTTrainer:
                     metrics = tu.get(output, "metrics")
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
-                    for k in ["loss", "grad_norm", "lr", "mfu"]:
+                    for k in ["loss", "grad_norm", "draft_grad_norm", "lr", "mfu"]:
                         if k in metrics.keys():
                             value = metrics.pop(k)
                             metrics[f"train/{k}"] = value

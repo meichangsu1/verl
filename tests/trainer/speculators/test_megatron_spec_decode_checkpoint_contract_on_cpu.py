@@ -46,8 +46,19 @@ def test_draft_uses_megatron_optimizer_contract():
     assert "def _sync_draft_gradients" not in content
 
 
-def test_pipeline_hidden_aggregation_contract_exists():
+def test_pipeline_hidden_cross_stage_transport_is_removed():
     content = _read_megatron_impl()
-    assert "broadcast_from_megatron_pp" in content
-    assert "all_gather_object(" in content
-    assert "required_abs_layer_ids" in content
+    assert "def _queue_spec_hidden_transfer" not in content
+    assert "def _recv_spec_hidden_with_timeout" not in content
+    assert "def _aggregate_hidden_to_draft_stage" not in content
+    assert "send_thread_" not in content
+    assert "recv_header_" not in content
+    assert "recv_payload_" not in content
+
+
+def test_pp_spec_decode_unsupported_contract_exists():
+    content = _read_megatron_impl()
+    assert "Megatron spec decode training does not support pipeline parallel > 1." in content
+    assert "Please set engine.pipeline_model_parallel_size=1." in content
+    assert "missing_on_draft=" not in content
+    assert "draft_local_abs=" not in content

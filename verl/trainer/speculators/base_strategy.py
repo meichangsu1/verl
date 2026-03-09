@@ -147,101 +147,6 @@ class TemplateSpecDecodeStrategy(BaseSpecDecodeStrategy):
             init=init_mode,
         )
 
-    def initialize(
-        self,
-        target_model,
-        spec_decode_cfg: dict[str, Any],
-        runtime_ctx: StrategyRuntimeContext,
-    ) -> None:
-        self.target_model = target_model
-        self.spec_decode_cfg = self._as_dict(spec_decode_cfg, name="spec_decode_cfg")
-        strategy_cfg = self.spec_decode_cfg.get("strategy_config", self.spec_decode_cfg.get("config", {}))
-        self.strategy_cfg = self._as_dict(strategy_cfg, name="model.spec_decode.strategy_config")
-        self.loss_cfg = self._as_dict(self.spec_decode_cfg.get("loss", {}), name="model.spec_decode.loss")
-        self.runtime_ctx = runtime_ctx
-        self._enable_draft_module = bool(getattr(runtime_ctx, "enable_draft_module", True))
-
-        self._target_embed_tokens = self._find_target_embed_tokens()
-        self._target_lm_head = self._find_target_lm_head()
-
-        if self._enable_draft_module:
-            if self.draft_model is None:
-                self.draft_model = self.build_draft_module(target_model=target_model, strategy_cfg=self.strategy_cfg)
-            if self.draft_model is None:
-                raise ValueError(f"{self.__class__.__name__} failed to build draft model.")
-            self._draft_config_obj = getattr(self.draft_model, "config", self._draft_config_obj)
-        else:
-            self.draft_model = None
-            self._draft_config_obj = None
-
-    def bind_draft_module(self, draft_module) -> None:
-        if draft_module is None:
-            raise ValueError("bind_draft_module received None draft_module")
-        self.draft_model = draft_module
-        if self._draft_config_obj is None:
-            self._draft_config_obj = getattr(draft_module, "config", None)
-
-    def build_draft_module(self, target_model, strategy_cfg: dict[str, Any]):
-        del target_model, strategy_cfg
-        spec = self._resolve_draft_model_spec()
-
-        if spec.init == "pretrained":
-            if not spec.path:
-                raise ValueError(
-                    "draft_model.init=pretrained requires model.spec_decode.draft_model.path "
-                    "when target-model config fallback is disabled."
-                )
-            model = AutoDraftModel.from_pretrained(
-                spec.path,
-                trust_remote_code=spec.trust_remote_code,
-                torch_dtype=self.runtime_ctx.torch_dtype,
-            )
-        elif spec.init == "from_config":
-            if not spec.path:
-                raise ValueError(
-                    "draft_model.init=from_config requires model.spec_decode.draft_model.path "
-                    "when target-model config fallback is disabled."
-                )
-            AutoDraftModel.maybe_load_local_plugins(spec.path)
-            try:
-                draft_config = AutoConfig.from_pretrained(spec.path, trust_remote_code=spec.trust_remote_code)
-            except Exception as exc:
-                raise ValueError(
-                    "draft_model.init=from_config failed to load config from "
-                    f"model.spec_decode.draft_model.path={spec.path!r}."
-                ) from exc
-            explicit_reference_path = self._normalize_path(getattr(draft_config, "reference_model_path", None))
-            if explicit_reference_path is None:
-                target_model_path = self._resolve_target_model_path(target_config=None)
-                if target_model_path is not None:
-                    setattr(draft_config, "reference_model_path", target_model_path)
-            model = AutoDraftModel.from_config(
-                draft_config,
-                trust_remote_code=spec.trust_remote_code,
-                torch_dtype=self.runtime_ctx.torch_dtype,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported draft_model.init={spec.init}. Expected one of ['pretrained', 'from_config']."
-            )
-        self._draft_config_obj = getattr(model, "config", None)
-        return model
-
-    def compute_step_loss(
-        self,
-        target_view: TargetRuntimeView,
-    ) -> LossOutput:
-        teacher_signals = self.extract_teacher_signals(target_view=target_view)
-        draft_request = self.build_draft_forward_request(teacher_signals=teacher_signals)
-        draft_output = self.forward_draft(draft_request=draft_request)
-        loss_output = self.compute_draft_loss(
-            draft_output=draft_output,
-            teacher_signals=teacher_signals,
-        )
-        if "speculator_loss" not in loss_output.metrics:
-            loss_output.metrics["speculator_loss"] = float(loss_output.total_loss.detach().float().item())
-        return loss_output
-
     @staticmethod
     def _normalize_forward_output(raw_output) -> DraftForwardOutput:
         if isinstance(raw_output, DraftForwardOutput):
@@ -358,6 +263,101 @@ class TemplateSpecDecodeStrategy(BaseSpecDecodeStrategy):
             correct = ((preds == flat_labels).float() * valid).sum()
             acc = correct / denom
         return loss, acc
+
+    def initialize(
+        self,
+        target_model,
+        spec_decode_cfg: dict[str, Any],
+        runtime_ctx: StrategyRuntimeContext,
+    ) -> None:
+        self.target_model = target_model
+        self.spec_decode_cfg = self._as_dict(spec_decode_cfg, name="spec_decode_cfg")
+        strategy_cfg = self.spec_decode_cfg.get("strategy_config", self.spec_decode_cfg.get("config", {}))
+        self.strategy_cfg = self._as_dict(strategy_cfg, name="model.spec_decode.strategy_config")
+        self.loss_cfg = self._as_dict(self.spec_decode_cfg.get("loss", {}), name="model.spec_decode.loss")
+        self.runtime_ctx = runtime_ctx
+        self._enable_draft_module = bool(getattr(runtime_ctx, "enable_draft_module", True))
+
+        self._target_embed_tokens = self._find_target_embed_tokens()
+        self._target_lm_head = self._find_target_lm_head()
+
+        if self._enable_draft_module:
+            if self.draft_model is None:
+                self.draft_model = self.build_draft_module(target_model=target_model, strategy_cfg=self.strategy_cfg)
+            if self.draft_model is None:
+                raise ValueError(f"{self.__class__.__name__} failed to build draft model.")
+            self._draft_config_obj = getattr(self.draft_model, "config", self._draft_config_obj)
+        else:
+            self.draft_model = None
+            self._draft_config_obj = None
+
+    def bind_draft_module(self, draft_module) -> None:
+        if draft_module is None:
+            raise ValueError("bind_draft_module received None draft_module")
+        self.draft_model = draft_module
+        if self._draft_config_obj is None:
+            self._draft_config_obj = getattr(draft_module, "config", None)
+
+    def build_draft_module(self, target_model, strategy_cfg: dict[str, Any]):
+        del target_model, strategy_cfg
+        spec = self._resolve_draft_model_spec()
+
+        if spec.init == "pretrained":
+            if not spec.path:
+                raise ValueError(
+                    "draft_model.init=pretrained requires model.spec_decode.draft_model.path "
+                    "when target-model config fallback is disabled."
+                )
+            model = AutoDraftModel.from_pretrained(
+                spec.path,
+                trust_remote_code=spec.trust_remote_code,
+                torch_dtype=self.runtime_ctx.torch_dtype,
+            )
+        elif spec.init == "from_config":
+            if not spec.path:
+                raise ValueError(
+                    "draft_model.init=from_config requires model.spec_decode.draft_model.path "
+                    "when target-model config fallback is disabled."
+                )
+            AutoDraftModel.maybe_load_local_plugins(spec.path)
+            try:
+                draft_config = AutoConfig.from_pretrained(spec.path, trust_remote_code=spec.trust_remote_code)
+            except Exception as exc:
+                raise ValueError(
+                    "draft_model.init=from_config failed to load config from "
+                    f"model.spec_decode.draft_model.path={spec.path!r}."
+                ) from exc
+            explicit_reference_path = self._normalize_path(getattr(draft_config, "reference_model_path", None))
+            if explicit_reference_path is None:
+                target_model_path = self._resolve_target_model_path(target_config=None)
+                if target_model_path is not None:
+                    setattr(draft_config, "reference_model_path", target_model_path)
+            model = AutoDraftModel.from_config(
+                draft_config,
+                trust_remote_code=spec.trust_remote_code,
+                torch_dtype=self.runtime_ctx.torch_dtype,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported draft_model.init={spec.init}. Expected one of ['pretrained', 'from_config']."
+            )
+        self._draft_config_obj = getattr(model, "config", None)
+        return model
+
+    def compute_step_loss(
+        self,
+        target_view: TargetRuntimeView,
+    ) -> LossOutput:
+        teacher_signals = self.extract_teacher_signals(target_view=target_view)
+        draft_request = self.build_draft_forward_request(teacher_signals=teacher_signals)
+        draft_output = self.forward_draft(draft_request=draft_request)
+        loss_output = self.compute_draft_loss(
+            draft_output=draft_output,
+            teacher_signals=teacher_signals,
+        )
+        if "speculator_loss" not in loss_output.metrics:
+            loss_output.metrics["speculator_loss"] = float(loss_output.total_loss.detach().float().item())
+        return loss_output
 
     def extract_teacher_signals(self, target_view: TargetRuntimeView) -> dict[str, Any]:
         del target_view

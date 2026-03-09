@@ -109,8 +109,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
             self._setup_embeddings_and_lm_heads(
                 model_path=str(reference_model_path),
                 trust_remote_code=bool(getattr(config, "reference_trust_remote_code", False)),
-                freeze_embed_tokens=bool(getattr(config, "freeze_reference_embed_tokens", False)),
-                freeze_lm_head=bool(getattr(config, "freeze_reference_lm_head", False)),
             )
 
     @staticmethod
@@ -211,8 +209,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
         *,
         model_path: str,
         trust_remote_code: bool,
-        freeze_embed_tokens: bool,
-        freeze_lm_head: bool,
     ) -> None:
         source_config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         if hasattr(source_config, "text_config"):
@@ -245,11 +241,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
 
         self.embed_tokens.weight.data.copy_(embed_tokens_weight.to(dtype=self.embed_tokens.weight.dtype))
         self.lm_head.weight.data.copy_(lm_head_weight.to(dtype=self.lm_head.weight.dtype))
-
-        if freeze_embed_tokens:
-            self.embed_tokens.weight.requires_grad = False
-        if freeze_lm_head:
-            self.lm_head.weight.requires_grad = False
 
     def forward(
         self,

@@ -39,7 +39,6 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
         self.pad_token_id = 0
         self.ignore_index = -100
         self.aux_hidden_layers: list[int] = [1, -2, -1]
-        self.reuse_target_lm_head = False
 
     def _resolve_aux_hidden_layers(self, target_config, strategy_cfg: dict[str, Any]) -> list[int]:
         aux_hidden_layers = strategy_cfg.get("aux_hidden_layers", None)
@@ -68,6 +67,38 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
             )
         return resolved
 
+    def _apply_draft_freeze_from_config(self) -> None:
+        if self.draft_model is None:
+            return
+        draft_cfg = self._draft_config_obj
+        freeze_embed_tokens = bool(getattr(draft_cfg, "freeze_reference_embed_tokens", False))
+        freeze_lm_head = bool(getattr(draft_cfg, "freeze_reference_lm_head", False))
+        if not (freeze_embed_tokens or freeze_lm_head):
+            return
+
+        draft_model = self._unwrap_model(self.draft_model)
+        if freeze_embed_tokens:
+            embed_tokens = getattr(draft_model, "embed_tokens", None)
+            if embed_tokens is None and hasattr(draft_model, "get_input_embeddings"):
+                embed_tokens = draft_model.get_input_embeddings()
+            if embed_tokens is None or not hasattr(embed_tokens, "weight"):
+                raise ValueError(
+                    "Eagle3Strategy configured freeze_reference_embed_tokens=True, "
+                    "but draft model has no accessible embedding weight."
+                )
+            embed_tokens.weight.requires_grad = False
+
+        if freeze_lm_head:
+            lm_head = getattr(draft_model, "lm_head", None)
+            if lm_head is None and hasattr(draft_model, "get_output_embeddings"):
+                lm_head = draft_model.get_output_embeddings()
+            if lm_head is None or not hasattr(lm_head, "weight"):
+                raise ValueError(
+                    "Eagle3Strategy configured freeze_reference_lm_head=True, "
+                    "but draft model has no accessible lm_head weight."
+                )
+            lm_head.weight.requires_grad = False
+
     def initialize(self, target_model, spec_decode_cfg: dict[str, Any], runtime_ctx) -> None:
         super().initialize(target_model=target_model, spec_decode_cfg=spec_decode_cfg, runtime_ctx=runtime_ctx)
         cfg = self.strategy_cfg
@@ -80,12 +111,11 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
         default_pad_id = getattr(target_config, "pad_token_id", 0) or 0
         self.pad_token_id = int(cfg.get("pad_token_id", default_pad_id))
         self.aux_hidden_layers = self._resolve_aux_hidden_layers(target_config=target_config, strategy_cfg=cfg)
+        self._apply_draft_freeze_from_config()
 
-        self.reuse_target_lm_head = bool(cfg.get("reuse_target_lm_head", False))
-        if self.reuse_target_lm_head and self._target_lm_head is None:
-            raise ValueError(
-                "Eagle3Strategy configured with reuse_target_lm_head=True, but target model has no lm_head."
-            )
+    def bind_draft_module(self, draft_module) -> None:
+        super().bind_draft_module(draft_module=draft_module)
+        self._apply_draft_freeze_from_config()
 
     def build_draft_module(self, target_model, strategy_cfg: dict[str, Any]):
         return super().build_draft_module(target_model=target_model, strategy_cfg=strategy_cfg)
@@ -94,15 +124,12 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
         return TargetSignalRequest(
             hidden_layers=list(self.aux_hidden_layers),
             include_input_embeddings=False,
-            reuse_target_lm_head_module=self.reuse_target_lm_head,
         )
 
     def _resolve_hidden_tensor(self, target_view: TargetRuntimeView, layer_id: int):
         tensor = target_view.hidden_by_layer.get(layer_id, None)
         if tensor is not None:
             return tensor
-        if layer_id == -1 and target_view.last_hidden is not None:
-            return target_view.last_hidden
         if layer_id < 0 and target_view.hidden_by_layer:
             sorted_ids = sorted(target_view.hidden_by_layer.keys())
             idx = len(sorted_ids) + layer_id
@@ -147,18 +174,48 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
                 f"Eagle3Strategy expects concatenated teacher hidden size {expected_concat_size}, "
                 f"but got {concat_hidden.shape[-1]}."
             )
-        input_embeddings = target_view.input_embeddings
-
         labels = self._resolve_labels(target_view)
         if labels is None:
             labels = input_ids
         loss_mask = self._resolve_loss_mask(target_view=target_view)
+        attention_mask = target_view.attention_mask
+        position_ids = target_view.position_ids
+        input_embeddings = target_view.input_embeddings
+
+        # In Megatron no-padding path, captured teacher hidden may exclude the terminal token state
+        # while input_ids still includes it. Align once at source for consistent TTT behavior.
+        hidden_seq_len = concat_hidden.shape[1]
+        input_seq_len = input_ids.shape[1]
+        if input_seq_len != hidden_seq_len:
+            if input_seq_len == hidden_seq_len + 1:
+                input_ids = input_ids[:, :hidden_seq_len]
+                if labels is not None:
+                    labels = labels[:, :hidden_seq_len]
+                if loss_mask is not None:
+                    loss_mask = loss_mask[:, :hidden_seq_len]
+                if attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.ndim >= 2:
+                    attention_mask = attention_mask[:, :hidden_seq_len]
+                if position_ids is not None and torch.is_tensor(position_ids):
+                    if position_ids.ndim >= 2:
+                        position_ids = position_ids[:, :hidden_seq_len]
+                    elif position_ids.ndim == 1:
+                        position_ids = position_ids[:hidden_seq_len]
+                if input_embeddings is not None and torch.is_tensor(input_embeddings) and input_embeddings.ndim >= 2:
+                    input_embeddings = input_embeddings[:, :hidden_seq_len, ...]
+            else:
+                raise ValueError(
+                    "Eagle3Strategy found sequence mismatch between input_ids and teacher hidden states. "
+                    f"input_ids.shape={tuple(input_ids.shape)}, teacher_hidden.shape={tuple(concat_hidden.shape)}. "
+                    "Only a +1 terminal-token mismatch is supported; other mismatches indicate upstream "
+                    "target hidden capture/aggregation issues."
+                )
+
         phase = target_view.backend_payload.get("phase", None)
 
         return {
             "input_ids": input_ids,
-            "attention_mask": target_view.attention_mask,
-            "position_ids": target_view.position_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
             "loss_mask": loss_mask,
             "labels": labels,
             "concat_hidden": concat_hidden,
@@ -240,13 +297,10 @@ class Eagle3Strategy(TemplateSpecDecodeStrategy):
             next_hidden = parsed.hidden_states if parsed.hidden_states is not None else hidden_states
             logits = parsed.logits
             if logits is None:
-                if self.reuse_target_lm_head and self._target_lm_head is not None:
-                    logits = self._target_lm_head(next_hidden)
-                else:
-                    raise ValueError(
-                        "Eagle3Strategy requires draft model to return logits when reuse_target_lm_head is False."
-                    )
-            logits = self._normalize_logits_layout(logits, batch_size=step_input_ids.shape[0], seq_len=step_input_ids.shape[1])
+                raise ValueError("Eagle3Strategy requires draft model forward to return logits.")
+            logits = self._normalize_logits_layout(
+                logits, batch_size=step_input_ids.shape[0], seq_len=step_input_ids.shape[1]
+            )
 
             logits_per_step.append(logits)
             labels_per_step.append(step_labels)

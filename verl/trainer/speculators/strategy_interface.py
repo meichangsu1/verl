@@ -35,13 +35,30 @@ class StrategyRuntimeContext:
 
 @dataclass
 class TargetRuntimeView:
+    """Runtime teacher-signal container passed from engine to spec strategy.
+
+    Field formats:
+    - input_ids: token ids for the current micro-batch, usually shape [B, S].
+    - attention_mask: optional mask aligned with input_ids; common shapes are
+      [B, S] or backend-specific expanded mask tensors.
+    - position_ids: optional position ids aligned with input_ids, typically
+      [B, S] (or [S] for degenerate single-batch paths).
+    - loss_mask: optional token-level supervision mask, usually [B, S].
+    - labels: optional token labels for CE-style objectives, usually [B, S].
+    - hidden_by_layer: mapping {layer_id -> hidden tensor}; each value is
+      usually dense [B, S, H] and already detached from teacher autograd.
+    - input_embeddings: optional teacher input embeddings, usually [B, S, H].
+    - packed_seq_params: optional packed-sequence metadata used by backends
+      that run with no-padding/packed layouts.
+    - raw_output: raw target model forward output for debugging/compatibility.
+    - backend_payload: extra backend metadata (for example {"phase": "train"}).
+    """
     input_ids: Any
     attention_mask: Optional[Any]
     position_ids: Optional[Any]
     loss_mask: Optional[Any]
     labels: Optional[Any] = None
     hidden_by_layer: dict[int, Any] = field(default_factory=dict)
-    last_hidden: Optional[Any] = None
     input_embeddings: Optional[Any] = None
     packed_seq_params: Optional[Any] = None
     raw_output: Any = None

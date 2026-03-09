@@ -126,6 +126,12 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        spec_decode_cfg = config.actor_rollout_ref.model.get("spec_decode", None)
+        if spec_decode_cfg is not None and use_legacy_worker_impl != "disable":
+            raise RuntimeError(
+                "PPO spec decode requires trainer.use_legacy_worker_impl=disable "
+                "so ActorRolloutRefWorker can route actor to language_model_with_speculator."
+            )
 
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":

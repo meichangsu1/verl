@@ -318,6 +318,8 @@ class SFTTrainer:
                 # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                 metrics["train/loss"] = metrics.pop("loss")
                 metrics["train/grad_norm"] = metrics.pop("grad_norm")
+                if "draft_grad_norm" in metrics:
+                    metrics["train/draft_grad_norm"] = metrics.pop("draft_grad_norm")
                 metrics["train/lr"] = metrics.pop("lr")
                 metrics["train/mfu"] = metrics.pop("mfu")
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()

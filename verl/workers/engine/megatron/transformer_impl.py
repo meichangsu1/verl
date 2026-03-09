@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import time
 from functools import partial
 from typing import Any, Callable, ContextManager, Iterator, Optional
 
@@ -42,7 +43,6 @@ from verl.utils.megatron.router_replay_utils import (
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
-    broadcast_from_megatron_pp,
     check_mtp_config,
     get_megatron_module_device,
     get_megatron_mtp_loss,
@@ -868,6 +868,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         self.draft_optimizer = None
         self.draft_lr_scheduler = None
         self._draft_ckpt_subdir = "speculator"
+        self._last_draft_grad_norm: Optional[float] = None
 
     def initialize(self):
         self._bootstrap_spec_decode()
@@ -878,6 +879,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             raise RuntimeError("Spec decode runtime context bootstrap failed for Megatron engine.")
 
         self._draft_active_on_rank = self._is_draft_active_on_rank()
+        self._validate_pp_spec_decode_support()
         if self.spec_decode_runtime_ctx is not None:
             self.spec_decode_runtime_ctx.enable_draft_module = self._draft_active_on_rank
 
@@ -899,32 +901,16 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
                 grad=self._is_offload_param,
             )
 
-    def _bootstrap_spec_decode(self) -> None:
-        from verl.utils.torch_dtypes import PrecisionType
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        return super().forward_backward_batch(data=data, loss_function=loss_function, forward_only=forward_only)
 
-        runtime_dtype = PrecisionType.to_dtype(self.engine_config.dtype)
-        bundle = build_engine_spec_decode_bundle(
-            model_config=self.model_config,
-            backend="megatron",
-            torch_dtype=runtime_dtype,
-            supports_packed_seq=False,
-            require=True,
-        )
-        self.spec_decode_cfg = bundle.config
-        self.spec_decode_strategy = bundle.strategy
-        self.spec_decode_runtime_ctx = bundle.runtime_context
-
-    def _is_draft_active_on_rank(self) -> bool:
-        try:
-            return bool(mpu.is_pipeline_last_stage(ignore_virtual=True))
-        except TypeError:
-            return bool(mpu.is_pipeline_last_stage())
-
-    def _is_draft_checkpoint_io_rank(self) -> bool:
-        if not self._draft_active_on_rank:
-            return False
-        return mpu.get_data_parallel_rank() == 0 and mpu.get_tensor_model_parallel_rank() == 0
-
+    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+        output = super().train_batch(data=data, loss_function=loss_function)
+        if output is not None and self.is_mp_src_rank_with_outputs() and self._last_draft_grad_norm is not None:
+            metrics = output.get("metrics", None) if isinstance(output, dict) else tu.get(output, "metrics", None)
+            if isinstance(metrics, dict):
+                metrics["draft_grad_norm"] = self._last_draft_grad_norm
+        return output
     def _wrap_draft_with_megatron_ddp(self) -> None:
         from megatron.core import tensor_parallel
         from megatron.core.distributed import DistributedDataParallel as MCoreDDP
@@ -944,7 +930,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         draft_module = draft_module.to(get_device_id())
 
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
             grad_reduce_in_fp32=True,
             overlap_grad_reduce=False,
         )
@@ -973,13 +959,615 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
             )
         optim_config_megatron = init_megatron_optim_config(
             self.optimizer_config,
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
             fp16=self.param_dtype == torch.float16,
         )
         self.draft_optimizer = get_megatron_optimizer(model=self.draft_chunks, config=optim_config_megatron)
         register_megatron_training_hooks(self.draft_chunks, self.draft_optimizer)
         self.draft_lr_scheduler = None
 
+    def forward_step(self, batch_iter: Iterator[TensorDict], model, postprocess_micro_batch_func):
+        if self._is_forward_only_postprocess(postprocess_micro_batch_func):
+            return super().forward_step(
+                batch_iter=batch_iter,
+                model=model,
+                postprocess_micro_batch_func=postprocess_micro_batch_func,
+            )
+
+        batch: TensorDict = next(batch_iter)
+        batch = batch.to(get_device_id())
+        model_inputs = self.prepare_model_inputs(batch)
+        input_ids = model_inputs["input_ids"]
+        multi_modal_inputs = model_inputs["multi_modal_inputs"]
+        pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        if pad_mode != DatasetPadMode.NO_PADDING:
+            raise NotImplementedError(f"Pad mode {pad_mode} is not supported for Megatron spec decode.")
+
+        is_ppo_batch = self._is_ppo_training_batch(batch)
+        calculate_entropy = bool(tu.get_non_tensor_data(batch, key="calculate_entropy", default=False))
+        temperature = batch.get("temperature", None)
+
+        hidden_layers, include_input_embeddings = self._resolve_target_signal_request()
+        data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
+        output = self._forward_target_with_hidden(
+            model,
+            input_ids,
+            multi_modal_inputs,
+            hidden_layers=hidden_layers,
+            include_input_embeddings=include_input_embeddings,
+            data_format=data_format,
+            compute_log_probs=is_ppo_batch,
+            calculate_entropy=calculate_entropy,
+            temperature=temperature,
+            loss_mask=model_inputs.get("loss_mask", None),
+        )
+
+        is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+        if is_last_stage:
+            output_tensor = output
+            loss_func = partial(postprocess_micro_batch_func, data=batch)
+        else:
+            output_tensor = output["model_output"] if isinstance(output, dict) else output
+            loss_func = None
+        return output_tensor, loss_func
+    def _resolve_target_signal_request(self) -> tuple[list[int], bool]:
+        if self.spec_decode_strategy is None:
+            raise RuntimeError("Spec decode strategy is not initialized.")
+
+        signal_req = self.spec_decode_strategy.get_target_signal_request()
+        hidden_layers = list(getattr(signal_req, "hidden_layers", [-1]) or [-1])
+        include_input_embeddings = bool(getattr(signal_req, "include_input_embeddings", False))
+
+        target_signals_cfg = {}
+        if hasattr(self.spec_decode_cfg, "get"):
+            target_signals_cfg = self.spec_decode_cfg.get("target_signals", {}) or {}
+        if hasattr(target_signals_cfg, "get"):
+            cfg_hidden_layers = target_signals_cfg.get("hidden_layers", None)
+            if cfg_hidden_layers is not None:
+                hidden_layers = [int(x) for x in cfg_hidden_layers]
+            include_input_embeddings = bool(
+                target_signals_cfg.get("include_input_embeddings", include_input_embeddings)
+            )
+
+        if not hidden_layers:
+            hidden_layers = [-1]
+        return hidden_layers, include_input_embeddings
+    def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
+        if forward_only:
+            return super().postprocess_micro_batch_func(
+                output=output,
+                data=data,
+                forward_only=forward_only,
+                loss_function=loss_function,
+            )
+
+        device = data["input_ids"].device
+        is_ppo_batch = self._is_ppo_training_batch(data)
+
+        ppo_loss = torch.zeros((), device=device)
+        ppo_metrics: dict[str, Any] = {}
+        if is_ppo_batch:
+            if loss_function is None:
+                raise RuntimeError("Megatron PPO training batch requires a non-None loss_function.")
+            raw_model_output = output.get("model_output", output) if isinstance(output, dict) else output
+            ppo_model_output = self.prepare_model_outputs(raw_model_output, data)
+            ppo_loss, ppo_metrics = loss_function(
+                model_output=ppo_model_output,
+                data=data,
+                dp_group=self.get_data_parallel_group(),
+            )
+            ppo_metrics = self._prefix_metrics(dict(ppo_metrics), "ppo")
+
+        spec_loss = torch.zeros((), device=device)
+        spec_metrics: dict[str, Any] = {"spec/speculator_loss": 0.0}
+        if self._draft_active_on_rank:
+            target_view = self._build_target_runtime_view(micro_batch=data, raw_output=output)
+            loss_output = self._compute_spec_decode_loss(target_view=target_view)
+            spec_loss = loss_output.total_loss
+            if not torch.is_tensor(spec_loss):
+                spec_loss = torch.tensor(float(spec_loss), device=device)
+            spec_metrics = self._prefix_metrics(dict(loss_output.metrics), "spec")
+
+        loss = ppo_loss + self._extract_spec_loss_coef() * spec_loss
+        if loss.ndim > 0:
+            loss = loss.mean()
+
+        # Keep a zero-valued autograd edge to target pipeline output so PP backward
+        # communication remains well-formed even when spec loss is independent from
+        # target model output activations.
+        pipeline_output_tensor = None
+        if isinstance(output, dict):
+            candidate = output.get("model_output", None)
+            if torch.is_tensor(candidate):
+                pipeline_output_tensor = candidate
+        elif torch.is_tensor(output):
+            pipeline_output_tensor = output
+        if torch.is_tensor(pipeline_output_tensor):
+            loss = loss + pipeline_output_tensor.sum() * 0.0
+
+        scaled_loss = loss * data["num_micro_batch"]
+
+        metrics: dict[str, Any] = {}
+        metrics.update(ppo_metrics)
+        metrics.update(spec_metrics)
+        model_output: dict[str, Any] = {}
+        output = {
+            "model_output": model_output,
+            "loss": float(loss.detach().item()),
+            "metrics": metrics,
+        }
+        return scaled_loss, output
+
+
+    def _forward_target_with_hidden(
+        self,
+        model,
+        input_ids,
+        multi_modal_inputs: dict[str, Any],
+        *,
+        hidden_layers: list[int],
+        include_input_embeddings: bool,
+        data_format: str,
+        compute_log_probs: bool = False,
+        calculate_entropy: bool = False,
+        temperature: Optional[Any] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        del include_input_embeddings
+        from verl.models.mcore import get_mcore_forward_no_padding_fn
+        from verl.models.mcore.util import (
+            postprocess_bshd_no_padding,
+            postprocess_thd_no_padding,
+            preprocess_bshd_no_padding,
+            preprocess_thd_no_padding,
+        )
+
+        unwrapped_model = unwrap_model(model)
+        decoder_layers = self._get_decoder_layers(unwrapped_model)
+        layer_global_ids = self._build_layer_global_ids(unwrapped_model, decoder_layers)
+        total_layers = self._infer_total_hidden_layers(unwrapped_model)
+        requested_pairs = self._normalize_requested_hidden_layer_pairs(hidden_layers, total_layers=total_layers)
+        requested_abs_sorted = sorted({abs_layer_id for _, abs_layer_id in requested_pairs})
+
+        if not decoder_layers:
+            raise RuntimeError(
+                "Megatron spec decode cannot capture hidden states because target decoder layers are not discoverable."
+            )
+
+        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+        logger.warning_once("Megatron target hidden extraction is forced to layer forward hooks in this build.")
+        captured_local_hidden: dict[int, torch.Tensor] = {}
+        hook_handles = []
+        for layer, global_layer_id in zip(decoder_layers, layer_global_ids, strict=True):
+            if global_layer_id not in requested_abs_sorted:
+                continue
+
+            def _hook(_module, _inputs, hook_output, *, _global_layer_id=global_layer_id):
+                hidden = self._extract_hidden_from_hook_output(hook_output)
+                if hidden is not None:
+                    captured_local_hidden[_global_layer_id] = hidden
+
+            hook_handles.append(layer.register_forward_hook(_hook))
+
+        try:
+            if compute_log_probs:
+                if temperature is None:
+                    raise RuntimeError("PPO training batch requires `temperature` in Megatron spec engine.")
+
+                if not isinstance(temperature, torch.Tensor):
+                    temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
+
+                temperature = temperature.to(torch.float32)
+                assert temperature.shape[0] == input_ids.shape[0], (
+                    f"temperature batch size mismatch: {temperature.shape[0]} vs input {input_ids.shape[0]}"
+                )
+                temperature = verl_F.expand_as_nested(temperature, input_ids)
+
+                label = input_ids.clone()
+
+                def logits_processor(logits, label, temperature):
+                    assert logits.shape[:2] == label.shape[:2]
+                    temperature = temperature.clone()
+                    temperature[temperature <= 0] = 1e-8
+                    logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
+                    ret = {}
+                    if calculate_entropy:
+                        logits_bak = logits.clone()
+                        ret["entropy"] = vocab_parallel_entropy(logits)
+                    else:
+                        logits_bak = logits
+                    ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
+                    return ret
+
+                logits_processor_args = {"label": label, "temperature": temperature}
+                if loss_mask is not None:
+                    logits_processor_args["loss_mask"] = loss_mask
+
+                model_output = forward_fn(
+                    model,
+                    input_ids,
+                    multi_modal_inputs,
+                    logits_processor=logits_processor,
+                    logits_processor_args=logits_processor_args,
+                    vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                    pad_token_id=self.model_config.tokenizer.pad_token_id,
+                    data_format=data_format,
+                    enable_mtp=self.model_config.mtp.enable_train,
+                )
+            else:
+                model_output = forward_fn(
+                    model,
+                    input_ids,
+                    multi_modal_inputs,
+                    vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                    pad_token_id=self.model_config.tokenizer.pad_token_id,
+                    data_format=data_format,
+                    enable_mtp=self.model_config.mtp.enable_train,
+                )
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        captured_hidden_by_abs: dict[int, torch.Tensor] = {
+            int(abs_layer_id): hidden
+            for abs_layer_id, hidden in captured_local_hidden.items()
+            if torch.is_tensor(hidden)
+        }
+
+        # Keep pipeline payload as tensor on non-last stages.
+        pipeline_model_output = model_output
+        if isinstance(model_output, (tuple, list)) and model_output:
+            first = model_output[0]
+            if torch.is_tensor(first):
+                pipeline_model_output = first
+
+        pre_process = bool(getattr(unwrapped_model, "pre_process", True))
+        if data_format == "thd":
+            _, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
+            postprocess_hidden = lambda hidden: postprocess_thd_no_padding(
+                hidden,
+                packed_seq_params,
+                input_ids,
+                batch_size=input_ids.shape[0],
+                post_process=True,
+            )
+        else:
+            _, attention_mask_bshd, _ = preprocess_bshd_no_padding(input_ids, pre_process=pre_process)
+            postprocess_hidden = lambda hidden: postprocess_bshd_no_padding(
+                hidden,
+                attention_mask_bshd,
+                post_process=True,
+            )
+
+        processed_hidden_by_abs: dict[int, torch.Tensor] = {}
+        for global_layer_id, raw_hidden in captured_hidden_by_abs.items():
+            normalized_hidden = self._normalize_hidden_for_postprocess(
+                raw_hidden,
+                data_format=data_format,
+                batch_size=input_ids.shape[0],
+            )
+            if normalized_hidden is None:
+                continue
+            processed_hidden = postprocess_hidden(normalized_hidden)
+            # Teacher hidden states are always consumed as detached draft inputs.
+            processed_hidden_by_abs[global_layer_id] = self._as_dense_hidden_tensor(processed_hidden).detach()
+
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        tp_group = mpu.get_tensor_model_parallel_group() if tp_world_size > 1 else None
+        expected_seq_len = self._infer_expected_seq_len_from_input_ids(input_ids)
+
+        owner_hidden_by_abs: dict[int, torch.Tensor] = {}
+        for abs_layer_id in requested_abs_sorted:
+            local_hidden = processed_hidden_by_abs.get(abs_layer_id, None)
+            local_has_hidden = int(torch.is_tensor(local_hidden))
+            presence_device = local_hidden.device if torch.is_tensor(local_hidden) else input_ids.device
+
+            if tp_world_size > 1:
+                has_tensor = torch.tensor([local_has_hidden], dtype=torch.int32, device=presence_device)
+                has_min = has_tensor.clone()
+                has_max = has_tensor.clone()
+                torch.distributed.all_reduce(has_min, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+                torch.distributed.all_reduce(has_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+                if int(has_min.item()) != int(has_max.item()):
+                    raise RuntimeError(
+                        "Megatron spec decode found inconsistent hidden capture across TP ranks. "
+                        f"abs_layer_id={abs_layer_id}, local_has_hidden={bool(local_has_hidden)}."
+                    )
+                if int(has_max.item()) == 0:
+                    raise RuntimeError(
+                        "Megatron spec decode failed to capture requested target hidden state on any TP rank. "
+                        f"abs_layer_id={abs_layer_id}."
+                    )
+            elif not local_has_hidden:
+                raise RuntimeError(
+                    "Megatron spec decode failed to capture requested target hidden state. "
+                    f"abs_layer_id={abs_layer_id}."
+                )
+
+            if not torch.is_tensor(local_hidden):
+                continue
+            owner_hidden = self._gather_hidden_to_draft_owner_tp(local_hidden, expected_seq_len=expected_seq_len)
+            if torch.is_tensor(owner_hidden):
+                # Teacher hidden states are always consumed as detached draft inputs.
+                owner_hidden_by_abs[abs_layer_id] = owner_hidden.detach()
+
+        hidden_states_map: dict[int, torch.Tensor] = {}
+        for layer_id, abs_layer_id in requested_pairs:
+            hidden = owner_hidden_by_abs.get(abs_layer_id, None)
+            if torch.is_tensor(hidden):
+                hidden_states_map[layer_id] = hidden
+
+        return {
+            "model_output": pipeline_model_output,
+            "hidden_states_map": hidden_states_map,
+        }
+
+    def _build_target_runtime_view(self, micro_batch: TensorDict, raw_output) -> TargetRuntimeView:
+        def _to_padded(tensor, pad_value):
+            if tensor is None or not torch.is_tensor(tensor):
+                return tensor
+            if tensor.is_nested:
+                return torch.nested.to_padded_tensor(tensor, padding=pad_value)
+            return tensor
+
+        def _get_hidden_states(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get("hidden_states", None)
+            return getattr(obj, "hidden_states", None)
+
+        hidden_layers, include_input_embeddings = self._resolve_target_signal_request()
+        raw_model_output = raw_output.get("model_output", None) if isinstance(raw_output, dict) else None
+
+        pad_token_id = self.model_config.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        input_ids = _to_padded(micro_batch.get("input_ids", None), pad_token_id)
+        labels = _to_padded(micro_batch.get("labels", None), -100)
+        if labels is None:
+            labels = input_ids
+        loss_mask = _to_padded(micro_batch.get("loss_mask", None), 0)
+        position_ids = _to_padded(micro_batch.get("position_ids", None), 0)
+        attention_mask = _to_padded(micro_batch.get("attention_mask", None), 0)
+        if attention_mask is None and torch.is_tensor(loss_mask):
+            attention_mask = loss_mask
+
+        raw_hidden_states_map = None
+        if isinstance(raw_output, dict):
+            raw_hidden_states_map = raw_output.get("hidden_states_map", None)
+
+        raw_hidden_states = _get_hidden_states(raw_output)
+        if raw_hidden_states is None:
+            raw_hidden_states = _get_hidden_states(raw_model_output)
+
+        hidden_by_layer: dict[int, Any] = {}
+        if isinstance(raw_hidden_states_map, dict):
+            for layer_id_raw, hidden_tensor in raw_hidden_states_map.items():
+                if hidden_tensor is None:
+                    continue
+                if not torch.is_tensor(hidden_tensor):
+                    continue
+                layer_id = int(layer_id_raw)
+                hidden_by_layer[layer_id] = _to_padded(hidden_tensor, 0)
+
+        if isinstance(raw_hidden_states, (tuple, list)):
+            n_hidden = len(raw_hidden_states)
+            for layer_id in hidden_layers:
+                idx = layer_id if layer_id >= 0 else n_hidden + layer_id
+                if idx < 0 or idx >= n_hidden:
+                    continue
+                hidden_tensor = raw_hidden_states[idx]
+                if torch.is_tensor(hidden_tensor):
+                    hidden_by_layer[layer_id] = _to_padded(hidden_tensor, 0)
+        elif torch.is_tensor(raw_hidden_states):
+            hidden_by_layer[-1] = _to_padded(raw_hidden_states, 0)
+
+        missing_hidden_layers = [layer_id for layer_id in hidden_layers if layer_id not in hidden_by_layer]
+        if missing_hidden_layers:
+            available = sorted(hidden_by_layer.keys())
+            raise RuntimeError(
+                "Megatron spec decode target hidden states are incomplete. "
+                f"requested={hidden_layers}, missing={missing_hidden_layers}, available={available}. "
+                "Please verify target_signals.hidden_layers. "
+                "Megatron spec decode training currently supports pipeline parallel size 1 only."
+            )
+
+        input_embeddings = None
+        if include_input_embeddings and torch.is_tensor(input_ids):
+            raw_input_embeddings = None
+            if isinstance(raw_output, dict):
+                raw_input_embeddings = raw_output.get("input_embeddings", raw_output.get("inputs_embeds", None))
+            else:
+                raw_input_embeddings = getattr(raw_output, "input_embeddings", None)
+                if raw_input_embeddings is None:
+                    raw_input_embeddings = getattr(raw_output, "inputs_embeds", None)
+            if raw_input_embeddings is None:
+                if isinstance(raw_model_output, dict):
+                    raw_input_embeddings = raw_model_output.get(
+                        "input_embeddings", raw_model_output.get("inputs_embeds", None)
+                    )
+                else:
+                    raw_input_embeddings = getattr(raw_model_output, "input_embeddings", None)
+                    if raw_input_embeddings is None:
+                        raw_input_embeddings = getattr(raw_model_output, "inputs_embeds", None)
+
+            if torch.is_tensor(raw_input_embeddings):
+                input_embeddings = raw_input_embeddings
+            else:
+                try:
+                    target_embed_module = None
+                    target_model = (
+                        self.spec_decode_strategy.target_model
+                        if hasattr(self.spec_decode_strategy, "target_model")
+                        else self.module[-1]
+                    )
+                    unwrapped_target = unwrap_model(target_model)
+                    if hasattr(unwrapped_target, "get_input_embeddings"):
+                        target_embed_module = unwrapped_target.get_input_embeddings()
+                    if target_embed_module is None:
+                        embedding = getattr(unwrapped_target, "embedding", None)
+                        target_embed_module = getattr(embedding, "word_embeddings", None)
+                    if target_embed_module is not None:
+                        input_embeddings = target_embed_module(input_ids)
+                except Exception:
+                    input_embeddings = None
+            if input_embeddings is None:
+                raise RuntimeError(
+                    "Megatron spec decode requested input embeddings, but they are unavailable on this pipeline stage. "
+                    "For pipeline parallel > 1, embedding reuse requires explicit cross-stage embedding forwarding."
+                )
+
+        hidden_by_layer = {layer_id: hidden.detach() for layer_id, hidden in hidden_by_layer.items()}
+        if torch.is_tensor(input_embeddings):
+            input_embeddings = input_embeddings.detach()
+
+        phase = tu.get_non_tensor_data(micro_batch, key="phase", default=self.mode)
+        backend_payload = {"phase": phase}
+        return TargetRuntimeView(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            loss_mask=loss_mask,
+            labels=labels,
+            hidden_by_layer=hidden_by_layer,
+            input_embeddings=input_embeddings,
+            packed_seq_params=None,
+            raw_output=raw_output,
+            backend_payload=backend_payload,
+        )
+    def _compute_spec_decode_loss(self, target_view: TargetRuntimeView) -> LossOutput:
+        if self.spec_decode_strategy is None:
+            raise RuntimeError("Spec decode strategy is not initialized.")
+        if not self._draft_active_on_rank:
+            zero = torch.zeros((), device=target_view.input_ids.device)
+            return LossOutput(total_loss=zero, metrics={"speculator_loss": 0.0})
+        draft_module = self.spec_decode_strategy.get_draft_module()
+        if draft_module is not None:
+            try:
+                draft_param = next(draft_module.parameters())
+                expected_device = None
+                if torch.is_tensor(target_view.input_ids):
+                    expected_device = target_view.input_ids.device
+                elif target_view.hidden_by_layer:
+                    hidden = next(iter(target_view.hidden_by_layer.values()))
+                    if torch.is_tensor(hidden):
+                        expected_device = hidden.device
+                if expected_device is not None and draft_param.device != expected_device:
+                    draft_module.to(expected_device)
+            except StopIteration:
+                pass
+
+        loss_output = self.spec_decode_strategy.compute_step_loss(target_view=target_view)
+        if not isinstance(loss_output, LossOutput):
+            raise TypeError(
+                f"Spec decode strategy must return LossOutput, got {type(loss_output).__name__}."
+            )
+        return loss_output
+
+    def _bootstrap_spec_decode(self) -> None:
+        from verl.utils.torch_dtypes import PrecisionType
+
+        runtime_dtype = PrecisionType.to_dtype(self.engine_config.dtype)
+        bundle = build_engine_spec_decode_bundle(
+            model_config=self.model_config,
+            backend="megatron",
+            torch_dtype=runtime_dtype,
+            supports_packed_seq=False,
+            require=True,
+        )
+        self.spec_decode_cfg = bundle.config
+        self.spec_decode_strategy = bundle.strategy
+        self.spec_decode_runtime_ctx = bundle.runtime_context
+
+    def _is_draft_active_on_rank(self) -> bool:
+        try:
+            is_last_stage = bool(mpu.is_pipeline_last_stage(ignore_virtual=True))
+        except TypeError:
+            is_last_stage = bool(mpu.is_pipeline_last_stage())
+        if not is_last_stage:
+            return False
+        return bool(mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0)
+
+    def _is_draft_checkpoint_io_rank(self) -> bool:
+        if not self._draft_active_on_rank:
+            return False
+        return mpu.get_data_parallel_rank() == 0 and mpu.get_tensor_model_parallel_rank() == 0
+
+    @staticmethod
+    def _hidden_seq_dim(hidden: torch.Tensor) -> int:
+        # Hidden states are typically [B, S, H], but some paths may emit [S, H].
+        return 1 if hidden.ndim >= 3 else 0
+
+    @staticmethod
+    def _infer_expected_seq_len_from_input_ids(input_ids: Any) -> Optional[int]:
+        if not torch.is_tensor(input_ids):
+            return None
+
+        if input_ids.ndim >= 2:
+            try:
+                return int(input_ids.shape[1])
+            except Exception:
+                pass
+
+        offsets_fn = getattr(input_ids, "offsets", None)
+        if callable(offsets_fn):
+            try:
+                offsets = offsets_fn()
+                if torch.is_tensor(offsets) and offsets.numel() > 1:
+                    return int(offsets.diff().max().item())
+            except Exception:
+                pass
+        return None
+
+    def _gather_hidden_to_draft_owner_tp(
+        self,
+        hidden: torch.Tensor,
+        *,
+        expected_seq_len: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if not torch.is_tensor(hidden):
+            return None
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        if tp_world_size <= 1:
+            return hidden
+
+        is_draft_owner = bool(mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0)
+        if not self.engine_config.sequence_parallel:
+            return hidden if is_draft_owner else None
+
+        seq_dim = self._hidden_seq_dim(hidden)
+        gather_needed = True
+        if expected_seq_len is not None and hidden.shape[seq_dim] >= expected_seq_len:
+            # Some kernels already materialize full sequence activations even when SP is enabled.
+            gather_needed = False
+
+        tp_group = mpu.get_tensor_model_parallel_group()
+        need_tensor = torch.tensor([int(gather_needed)], dtype=torch.int32, device=hidden.device)
+        need_min = need_tensor.clone()
+        need_max = need_tensor.clone()
+        torch.distributed.all_reduce(need_min, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+        torch.distributed.all_reduce(need_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        if int(need_min.item()) != int(need_max.item()):
+            raise RuntimeError(
+                "Megatron spec decode found inconsistent TP hidden layout across ranks under sequence_parallel. "
+                f"local_shape={tuple(hidden.shape)}, expected_seq_len={expected_seq_len}."
+            )
+        gather_needed = bool(int(need_max.item()))
+        if not gather_needed:
+            return hidden if is_draft_owner else None
+
+        gathered = [torch.empty_like(hidden) for _ in range(tp_world_size)]
+        torch.distributed.all_gather(gathered, hidden, group=tp_group)
+        if not is_draft_owner:
+            return None
+        owner_hidden = torch.cat(gathered, dim=seq_dim).contiguous()
+        if expected_seq_len is not None and owner_hidden.shape[seq_dim] > expected_seq_len:
+            owner_hidden = owner_hidden.narrow(dim=seq_dim, start=0, length=expected_seq_len).contiguous()
+        return owner_hidden
+
+   
     def optimizer_zero_grad(self):
         super().optimizer_zero_grad()
         if self.draft_optimizer is not None:
@@ -989,10 +1577,15 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
 
     def optimizer_step(self):
         grad_norm = super().optimizer_step()
+        self._last_draft_grad_norm = None
         if self.draft_optimizer is not None:
-            update_successful, _, _ = self.draft_optimizer.step()
+            update_successful, draft_grad_norm, _ = self.draft_optimizer.step()
             if not update_successful:
                 raise RuntimeError("Draft Megatron optimizer step failed.")
+            if torch.is_tensor(draft_grad_norm):
+                self._last_draft_grad_norm = float(draft_grad_norm.detach().item())
+            elif draft_grad_norm is not None:
+                self._last_draft_grad_norm = float(draft_grad_norm)
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -1100,28 +1693,7 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         self._load_draft_checkpoint(local_path=local_path)
         torch.distributed.barrier()
 
-    def _resolve_target_signal_request(self) -> tuple[list[int], bool]:
-        if self.spec_decode_strategy is None:
-            raise RuntimeError("Spec decode strategy is not initialized.")
 
-        signal_req = self.spec_decode_strategy.get_target_signal_request()
-        hidden_layers = list(getattr(signal_req, "hidden_layers", [-1]) or [-1])
-        include_input_embeddings = bool(getattr(signal_req, "include_input_embeddings", False))
-
-        target_signals_cfg = {}
-        if hasattr(self.spec_decode_cfg, "get"):
-            target_signals_cfg = self.spec_decode_cfg.get("target_signals", {}) or {}
-        if hasattr(target_signals_cfg, "get"):
-            cfg_hidden_layers = target_signals_cfg.get("hidden_layers", None)
-            if cfg_hidden_layers is not None:
-                hidden_layers = [int(x) for x in cfg_hidden_layers]
-            include_input_embeddings = bool(
-                target_signals_cfg.get("include_input_embeddings", include_input_embeddings)
-            )
-
-        if not hidden_layers:
-            hidden_layers = [-1]
-        return hidden_layers, include_input_embeddings
 
     @staticmethod
     def _extract_hidden_from_hook_output(hook_output: Any) -> Optional[torch.Tensor]:
@@ -1163,6 +1735,39 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
         if abs_id < 0 or abs_id >= total_layers:
             return None
         return abs_id
+
+    def _normalize_requested_hidden_layer_pairs(
+        self,
+        hidden_layers: list[int],
+        *,
+        total_layers: Optional[int],
+    ) -> list[tuple[int, int]]:
+        requested_pairs: list[tuple[int, int]] = []
+        for layer_id_raw in hidden_layers:
+            layer_id = int(layer_id_raw)
+            abs_layer_id = self._resolve_abs_layer_id(layer_id, total_layers)
+            if abs_layer_id is None:
+                if layer_id < 0:
+                    raise RuntimeError(
+                        "Megatron spec decode cannot resolve negative hidden layer indices without the total "
+                        f"number of transformer layers. requested layer={layer_id}, total_layers={total_layers}."
+                    )
+                raise RuntimeError(
+                    "Megatron spec decode received an invalid hidden layer request. "
+                    f"requested layer={layer_id}, total_layers={total_layers}."
+                )
+            requested_pairs.append((layer_id, abs_layer_id))
+        return requested_pairs
+
+    def _validate_pp_spec_decode_support(self) -> None:
+        pp_world_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_world_size <= 1:
+            return
+
+        raise RuntimeError(
+            "Megatron spec decode training does not support pipeline parallel > 1. "
+            f"current_pp_world_size={pp_world_size}. Please set engine.pipeline_model_parallel_size=1."
+        )
 
     @staticmethod
     def _normalize_hidden_for_postprocess(
@@ -1263,413 +1868,33 @@ class MegatronEngineWithLMHeadAndSpeculator(MegatronEngineWithLMHead):
                 global_ids.append(local_idx)
         return global_ids
 
-    def _forward_target_with_hidden(
-        self,
-        model,
-        input_ids,
-        multi_modal_inputs: dict[str, Any],
-        *,
-        hidden_layers: list[int],
-        include_input_embeddings: bool,
-        data_format: str,
-    ) -> dict[str, Any]:
-        del include_input_embeddings
-        from verl.models.mcore import get_mcore_forward_no_padding_fn
-        from verl.models.mcore.util import (
-            postprocess_bshd_no_padding,
-            postprocess_thd_no_padding,
-            preprocess_bshd_no_padding,
-            preprocess_thd_no_padding,
-        )
 
-        unwrapped_model = unwrap_model(model)
-        decoder_layers = self._get_decoder_layers(unwrapped_model)
-        layer_global_ids = self._build_layer_global_ids(unwrapped_model, decoder_layers)
-        total_layers = self._infer_total_hidden_layers(unwrapped_model)
-        requested_abs_layer_ids = {
-            abs_id
-            for abs_id in (self._resolve_abs_layer_id(layer_id, total_layers) for layer_id in hidden_layers)
-            if abs_id is not None
-        }
+    @staticmethod
+    def _is_forward_only_postprocess(postprocess_micro_batch_func) -> bool:
+        if isinstance(postprocess_micro_batch_func, partial):
+            return bool(postprocess_micro_batch_func.keywords.get("forward_only", False))
+        return False
 
-        if not decoder_layers:
-            raise RuntimeError(
-                "Megatron spec decode cannot capture hidden states because target decoder layers are not discoverable."
-            )
+    @staticmethod
+    def _is_ppo_training_batch(batch: TensorDict) -> bool:
+        required_keys = {"old_log_probs", "advantages", "responses", "response_mask"}
+        return all(key in batch.keys() for key in required_keys)
 
-        capture_global_ids = set(requested_abs_layer_ids)
-        capture_last_hidden = -1 in hidden_layers
-        if capture_last_hidden:
-            capture_global_ids.add(layer_global_ids[-1])
-
-        captured_local_hidden: dict[int, torch.Tensor] = {}
-        hook_handles = []
-        for layer, global_layer_id in zip(decoder_layers, layer_global_ids, strict=True):
-            if global_layer_id not in capture_global_ids:
-                continue
-
-            def _hook(_module, _inputs, hook_output, *, _global_layer_id=global_layer_id):
-                hidden = self._extract_hidden_from_hook_output(hook_output)
-                if hidden is not None:
-                    captured_local_hidden[_global_layer_id] = hidden
-
-            hook_handles.append(layer.register_forward_hook(_hook))
-
-        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+    def _extract_spec_loss_coef(self) -> float:
+        default_coef = 1.0
+        if self.spec_decode_cfg is None:
+            return default_coef
+        loss_cfg = self.spec_decode_cfg.get("loss", {})
+        if not hasattr(loss_cfg, "get"):
+            return default_coef
         try:
-            model_output = forward_fn(
-                model,
-                input_ids,
-                multi_modal_inputs,
-                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
-                pad_token_id=self.model_config.tokenizer.pad_token_id,
-                data_format=data_format,
-                enable_mtp=self.model_config.mtp.enable_train,
-            )
-        finally:
-            for handle in hook_handles:
-                handle.remove()
+            return float(loss_cfg.get("coef", default_coef))
+        except (TypeError, ValueError):
+            return default_coef
 
-        pre_process = bool(getattr(unwrapped_model, "pre_process", True))
-        if data_format == "thd":
-            _, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
-            postprocess_hidden = lambda hidden: postprocess_thd_no_padding(
-                hidden,
-                packed_seq_params,
-                input_ids,
-                batch_size=input_ids.shape[0],
-                post_process=True,
-            )
-        else:
-            _, attention_mask_bshd, _ = preprocess_bshd_no_padding(input_ids, pre_process=pre_process)
-            postprocess_hidden = lambda hidden: postprocess_bshd_no_padding(
-                hidden,
-                attention_mask_bshd,
-                post_process=True,
-            )
-
-        processed_hidden_by_abs: dict[int, torch.Tensor] = {}
-        for global_layer_id, raw_hidden in captured_local_hidden.items():
-            normalized_hidden = self._normalize_hidden_for_postprocess(
-                raw_hidden,
-                data_format=data_format,
-                batch_size=input_ids.shape[0],
-            )
-            if normalized_hidden is None:
-                continue
-            processed_hidden = postprocess_hidden(normalized_hidden)
-            processed_hidden_by_abs[global_layer_id] = self._as_dense_hidden_tensor(processed_hidden)
-
-        pp_group = mpu.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(group=pp_group)
-
-        global_last_abs_layer_id: Optional[int] = None
-        if capture_last_hidden:
-            if total_layers is not None:
-                global_last_abs_layer_id = total_layers - 1
-            else:
-                local_last_abs_layer_id = layer_global_ids[-1] if layer_global_ids else None
-                gathered_last_abs_layer_ids = [None] * pp_world_size
-                torch.distributed.all_gather_object(
-                    object_list=gathered_last_abs_layer_ids,
-                    obj=local_last_abs_layer_id,
-                    group=pp_group,
-                )
-                valid_last_abs_layer_ids = [
-                    int(layer_id)
-                    for layer_id in gathered_last_abs_layer_ids
-                    if isinstance(layer_id, int)
-                ]
-                if valid_last_abs_layer_ids:
-                    global_last_abs_layer_id = max(valid_last_abs_layer_ids)
-
-        required_abs_layer_ids = set(requested_abs_layer_ids)
-        if global_last_abs_layer_id is not None:
-            required_abs_layer_ids.add(global_last_abs_layer_id)
-
-        aggregated_hidden_by_abs: dict[int, torch.Tensor]
-        if pp_world_size > 1 and required_abs_layer_ids:
-            local_available_abs_layer_ids = sorted(processed_hidden_by_abs.keys())
-            gathered_available_abs_layer_ids = [None] * pp_world_size
-            torch.distributed.all_gather_object(
-                object_list=gathered_available_abs_layer_ids,
-                obj=local_available_abs_layer_ids,
-                group=pp_group,
-            )
-
-            owner_by_abs_layer_id: dict[int, int] = {}
-            for abs_layer_id in sorted(required_abs_layer_ids):
-                owner_pp_ranks = []
-                for pp_rank, available_ids in enumerate(gathered_available_abs_layer_ids):
-                    if isinstance(available_ids, list) and abs_layer_id in available_ids:
-                        owner_pp_ranks.append(pp_rank)
-                if len(owner_pp_ranks) > 1:
-                    raise RuntimeError(
-                        "Megatron spec decode found duplicated hidden ownership across pipeline ranks. "
-                        f"layer={abs_layer_id}, owners={owner_pp_ranks}"
-                    )
-                if len(owner_pp_ranks) == 1:
-                    owner_by_abs_layer_id[abs_layer_id] = owner_pp_ranks[0]
-
-            aggregated_hidden_by_abs = {}
-            for abs_layer_id in sorted(required_abs_layer_ids):
-                if abs_layer_id not in owner_by_abs_layer_id:
-                    continue
-                aggregated_hidden_by_abs[abs_layer_id] = broadcast_from_megatron_pp(
-                    processed_hidden_by_abs.get(abs_layer_id, None)
-                )
-        else:
-            aggregated_hidden_by_abs = dict(processed_hidden_by_abs)
-
-        hidden_states_map: dict[int, torch.Tensor] = {}
-        for layer_id in hidden_layers:
-            if layer_id == -1:
-                continue
-            abs_layer_id = self._resolve_abs_layer_id(layer_id, total_layers)
-            if abs_layer_id is None:
-                continue
-            hidden = aggregated_hidden_by_abs.get(abs_layer_id, None)
-            if hidden is not None:
-                hidden_states_map[layer_id] = hidden
-
-        last_hidden = None
-        if capture_last_hidden:
-            if global_last_abs_layer_id is not None:
-                last_hidden = aggregated_hidden_by_abs.get(global_last_abs_layer_id, None)
-            if last_hidden is None and layer_global_ids:
-                last_hidden = aggregated_hidden_by_abs.get(layer_global_ids[-1], None)
-            if last_hidden is not None:
-                hidden_states_map[-1] = last_hidden
-
-        return {
-            "model_output": model_output,
-            "hidden_states_map": hidden_states_map,
-            "last_hidden_state": last_hidden,
-        }
-
-    def _build_target_runtime_view(self, micro_batch: TensorDict, raw_output) -> TargetRuntimeView:
-        def _to_padded(tensor, pad_value):
-            if tensor is None or not torch.is_tensor(tensor):
-                return tensor
-            if tensor.is_nested:
-                return torch.nested.to_padded_tensor(tensor, padding=pad_value)
-            return tensor
-
-        def _get_hidden_states(obj):
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                return obj.get("hidden_states", None)
-            return getattr(obj, "hidden_states", None)
-
-        def _get_last_hidden(obj):
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                return obj.get("last_hidden_state", None)
-            return getattr(obj, "last_hidden_state", None)
-
-        hidden_layers, include_input_embeddings = self._resolve_target_signal_request()
-
-        pad_token_id = self.model_config.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = 0
-
-        input_ids = _to_padded(micro_batch.get("input_ids", None), pad_token_id)
-        labels = _to_padded(micro_batch.get("labels", None), -100)
-        if labels is None:
-            labels = input_ids
-        loss_mask = _to_padded(micro_batch.get("loss_mask", None), 0)
-        position_ids = _to_padded(micro_batch.get("position_ids", None), 0)
-        attention_mask = _to_padded(micro_batch.get("attention_mask", None), 0)
-        if attention_mask is None and torch.is_tensor(loss_mask):
-            attention_mask = loss_mask
-
-        raw_hidden_states_map = None
-        if isinstance(raw_output, dict):
-            raw_hidden_states_map = raw_output.get("hidden_states_map", None)
-
-        raw_hidden_states = _get_hidden_states(raw_output)
-        raw_last_hidden = _get_last_hidden(raw_output)
-        if raw_last_hidden is None and isinstance(raw_hidden_states, (tuple, list)) and raw_hidden_states:
-            raw_last_hidden = raw_hidden_states[-1]
-
-        hidden_by_layer: dict[int, Any] = {}
-        if isinstance(raw_hidden_states_map, dict):
-            for layer_id_raw, hidden_tensor in raw_hidden_states_map.items():
-                if hidden_tensor is None:
-                    continue
-                if not torch.is_tensor(hidden_tensor):
-                    continue
-                layer_id = int(layer_id_raw)
-                hidden_by_layer[layer_id] = _to_padded(hidden_tensor, 0)
-            if raw_last_hidden is None and -1 in hidden_by_layer:
-                raw_last_hidden = hidden_by_layer[-1]
-
-        if isinstance(raw_hidden_states, (tuple, list)):
-            n_hidden = len(raw_hidden_states)
-            for layer_id in hidden_layers:
-                idx = layer_id if layer_id >= 0 else n_hidden + layer_id
-                if idx < 0 or idx >= n_hidden:
-                    continue
-                hidden_tensor = raw_hidden_states[idx]
-                if torch.is_tensor(hidden_tensor):
-                    hidden_by_layer[layer_id] = _to_padded(hidden_tensor, 0)
-        elif torch.is_tensor(raw_hidden_states):
-            hidden_by_layer[-1] = _to_padded(raw_hidden_states, 0)
-            raw_last_hidden = raw_hidden_states
-
-        if torch.is_tensor(raw_last_hidden):
-            raw_last_hidden = _to_padded(raw_last_hidden, 0)
-        if -1 in hidden_layers and -1 not in hidden_by_layer and torch.is_tensor(raw_last_hidden):
-            hidden_by_layer[-1] = raw_last_hidden
-
-        missing_hidden_layers = [layer_id for layer_id in hidden_layers if layer_id not in hidden_by_layer]
-        if missing_hidden_layers:
-            available = sorted(hidden_by_layer.keys())
-            raise RuntimeError(
-                "Megatron spec decode target hidden states are incomplete. "
-                f"requested={hidden_layers}, missing={missing_hidden_layers}, available={available}. "
-                "Please verify target_signals.hidden_layers and pipeline hidden aggregation."
-            )
-
-        input_embeddings = None
-        if include_input_embeddings and torch.is_tensor(input_ids):
-            raw_input_embeddings = None
-            if isinstance(raw_output, dict):
-                raw_input_embeddings = raw_output.get("input_embeddings", raw_output.get("inputs_embeds", None))
-            else:
-                raw_input_embeddings = getattr(raw_output, "input_embeddings", None)
-                if raw_input_embeddings is None:
-                    raw_input_embeddings = getattr(raw_output, "inputs_embeds", None)
-
-            if torch.is_tensor(raw_input_embeddings):
-                input_embeddings = raw_input_embeddings
-            else:
-                try:
-                    target_embed_module = None
-                    target_model = (
-                        self.spec_decode_strategy.target_model
-                        if hasattr(self.spec_decode_strategy, "target_model")
-                        else self.module[-1]
-                    )
-                    unwrapped_target = unwrap_model(target_model)
-                    if hasattr(unwrapped_target, "get_input_embeddings"):
-                        target_embed_module = unwrapped_target.get_input_embeddings()
-                    if target_embed_module is None:
-                        embedding = getattr(unwrapped_target, "embedding", None)
-                        target_embed_module = getattr(embedding, "word_embeddings", None)
-                    if target_embed_module is not None:
-                        input_embeddings = target_embed_module(input_ids)
-                except Exception:
-                    input_embeddings = None
-            if input_embeddings is None:
-                raise RuntimeError(
-                    "Megatron spec decode requested input embeddings, but they are unavailable on this pipeline stage. "
-                    "For pipeline parallel > 1, embedding reuse requires explicit cross-stage embedding forwarding."
-                )
-
-        freeze_target = True
-        if hasattr(self.spec_decode_cfg, "get"):
-            freeze_target = bool(self.spec_decode_cfg.get("freeze_target", True))
-        if freeze_target:
-            hidden_by_layer = {layer_id: hidden.detach() for layer_id, hidden in hidden_by_layer.items()}
-            if torch.is_tensor(raw_last_hidden):
-                raw_last_hidden = raw_last_hidden.detach()
-            if torch.is_tensor(input_embeddings):
-                input_embeddings = input_embeddings.detach()
-
-        phase = tu.get_non_tensor_data(micro_batch, key="phase", default=self.mode)
-        backend_payload = {"phase": phase}
-        return TargetRuntimeView(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            loss_mask=loss_mask,
-            labels=labels,
-            hidden_by_layer=hidden_by_layer,
-            last_hidden=raw_last_hidden if torch.is_tensor(raw_last_hidden) else None,
-            input_embeddings=input_embeddings,
-            packed_seq_params=None,
-            raw_output=raw_output,
-            backend_payload=backend_payload,
-        )
-
-    def _compute_spec_decode_loss(self, target_view: TargetRuntimeView) -> LossOutput:
-        if self.spec_decode_strategy is None:
-            raise RuntimeError("Spec decode strategy is not initialized.")
-        if not self._draft_active_on_rank:
-            zero = torch.zeros((), device=target_view.input_ids.device)
-            return LossOutput(total_loss=zero, metrics={"speculator_loss": 0.0})
-        draft_module = self.spec_decode_strategy.get_draft_module()
-        if draft_module is not None:
-            try:
-                draft_param = next(draft_module.parameters())
-                expected_device = None
-                if torch.is_tensor(target_view.input_ids):
-                    expected_device = target_view.input_ids.device
-                elif torch.is_tensor(target_view.last_hidden):
-                    expected_device = target_view.last_hidden.device
-                if expected_device is not None and draft_param.device != expected_device:
-                    draft_module.to(expected_device)
-            except StopIteration:
-                pass
-
-        loss_output = self.spec_decode_strategy.compute_step_loss(target_view=target_view)
-        if not isinstance(loss_output, LossOutput):
-            raise TypeError(
-                f"Spec decode strategy must return LossOutput, got {type(loss_output).__name__}."
-            )
-        return loss_output
-
-    def forward_step(self, batch_iter: Iterator[TensorDict], model, postprocess_micro_batch_func):
-        batch: TensorDict = next(batch_iter)
-        batch = batch.to(get_device_id())
-        model_inputs = self.prepare_model_inputs(batch)
-        input_ids = model_inputs["input_ids"]
-        multi_modal_inputs = model_inputs["multi_modal_inputs"]
-        pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-        if pad_mode != DatasetPadMode.NO_PADDING:
-            raise NotImplementedError(f"Pad mode {pad_mode} is not supported for Megatron spec decode.")
-
-        hidden_layers, include_input_embeddings = self._resolve_target_signal_request()
-        data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
-        output = self._forward_target_with_hidden(
-            model,
-            input_ids,
-            multi_modal_inputs,
-            hidden_layers=hidden_layers,
-            include_input_embeddings=include_input_embeddings,
-            data_format=data_format,
-        )
-        return output, partial(postprocess_micro_batch_func, data=batch)
-
-    def postprocess_micro_batch_func(self, output, data: TensorDict, forward_only: bool, loss_function):
-        del loss_function
-        if not self._draft_active_on_rank:
-            zero = torch.zeros((), device=data["input_ids"].device)
-            return zero, {"model_output": {}, "loss": 0.0, "metrics": {}}
-        target_view = self._build_target_runtime_view(micro_batch=data, raw_output=output)
-        loss_output = self._compute_spec_decode_loss(target_view=target_view)
-        loss = loss_output.total_loss
-        if not torch.is_tensor(loss):
-            loss = torch.tensor(float(loss), device=data["input_ids"].device)
-        if loss.ndim > 0:
-            loss = loss.mean()
-
-        if forward_only:
-            scaled_loss = loss
-        else:
-            scaled_loss = loss * data["num_micro_batch"]
-
-        metrics = dict(loss_output.metrics)
-        model_output: dict[str, Any] = {}
-        output = {
-            "model_output": model_output,
-            "loss": float(loss.detach().item()),
-            "metrics": metrics,
-        }
-        return scaled_loss, output
+    @staticmethod
+    def _prefix_metrics(metrics: dict[str, Any], prefix: str) -> dict[str, Any]:
+        return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
 @EngineRegistry.register(model_type="value_model", backend="megatron")

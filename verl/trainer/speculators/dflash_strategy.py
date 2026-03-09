@@ -14,7 +14,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -113,8 +114,6 @@ class DFlashStrategy(TemplateSpecDecodeStrategy):
         tensor = target_view.hidden_by_layer.get(layer_id, None)
         if tensor is not None:
             return tensor
-        if layer_id == -1 and target_view.last_hidden is not None:
-            return target_view.last_hidden
         if layer_id < 0 and target_view.hidden_by_layer:
             sorted_ids = sorted(target_view.hidden_by_layer.keys())
             idx = len(sorted_ids) + layer_id
@@ -141,6 +140,30 @@ class DFlashStrategy(TemplateSpecDecodeStrategy):
         if logits.shape[0] == seq_len and logits.shape[1] == batch_size:
             return logits.transpose(0, 1).contiguous()
         return logits
+
+    @staticmethod
+    @contextmanager
+    def _temporarily_disable_module_param_grads(module: Any) -> Iterator[None]:
+        """Run module forward without creating parameter-gradient edges."""
+        if module is None or not hasattr(module, "parameters"):
+            yield
+            return
+
+        params = list(module.parameters())
+        if len(params) == 0:
+            yield
+            return
+
+        original_requires_grad = [bool(param.requires_grad) for param in params]
+        try:
+            for param, flag in zip(params, original_requires_grad, strict=True):
+                if flag:
+                    param.requires_grad_(False)
+            yield
+        finally:
+            for param, flag in zip(params, original_requires_grad, strict=True):
+                if param.requires_grad != flag:
+                    param.requires_grad_(flag)
 
     def _get_tp_world_size(self) -> int:
         backend = str(getattr(self.runtime_ctx, "backend", "")).lower()
@@ -291,9 +314,11 @@ class DFlashStrategy(TemplateSpecDecodeStrategy):
             if hidden is not None:
                 hidden_tensors.append(hidden)
         if not hidden_tensors:
-            if target_view.last_hidden is None:
-                raise ValueError("DFlashStrategy requires target hidden states.")
-            hidden_tensors = [target_view.last_hidden]
+            raise ValueError(
+                "DFlashStrategy requires target hidden states in target_view.hidden_by_layer, "
+                f"but none of target_layer_ids={self.target_layer_ids} were found. "
+                f"available={sorted(target_view.hidden_by_layer.keys())}."
+            )
 
         target_hidden = hidden_tensors[0] if len(hidden_tensors) == 1 else torch.cat(hidden_tensors, dim=-1)
 
@@ -369,7 +394,10 @@ class DFlashStrategy(TemplateSpecDecodeStrategy):
             if hidden is None:
                 raise ValueError("DFlashStrategy requires draft output hidden states or logits.")
             if self.reuse_target_lm_head and self._target_lm_head is not None:
-                logits = self._extract_logits_tensor(self._target_lm_head(hidden))
+                # Keep gradients w.r.t. hidden (draft path) while preventing spec loss
+                # from updating target lm_head parameters.
+                with self._temporarily_disable_module_param_grads(self._target_lm_head):
+                    logits = self._extract_logits_tensor(self._target_lm_head(hidden))
             else:
                 raise ValueError("DFlashStrategy requires draft model to return logits when reuse_target_lm_head=False.")
         if logits is None:

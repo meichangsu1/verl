@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from typing import Optional
+
 import torch
 
 from verl.utils.megatron_utils import unwrap_model
@@ -29,6 +32,75 @@ from .util import (
     preprocess_packed_seqs,
     preprocess_thd_no_padding,
 )
+
+_SPEC_EXTRACT_DEBUG_PRINTED = False
+
+
+def _log_extract_layer_indices_path(model, *, extra_block_kwargs: Optional[dict], branch: str):
+    global _SPEC_EXTRACT_DEBUG_PRINTED
+    if _SPEC_EXTRACT_DEBUG_PRINTED:
+        return
+    _SPEC_EXTRACT_DEBUG_PRINTED = True
+
+    rank = -1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    unwrapped_model = unwrap_model(model)
+    extract_layer_indices = None
+    if extra_block_kwargs is not None:
+        extract_layer_indices = extra_block_kwargs.get("extract_layer_indices", None)
+    sys.stderr.write(
+        "[spec_extract_debug] "
+        f"rank={rank} "
+        f"file={__file__} "
+        f"branch={branch} "
+        f"model_class={type(unwrapped_model).__name__} "
+        f"extract_layer_indices={extract_layer_indices}\n"
+    )
+    sys.stderr.flush()
+
+
+def _forward_decoder_with_extract_layers(
+    model,
+    *,
+    input_ids,
+    attention_mask,
+    position_ids,
+    packed_seq_params,
+    extra_block_kwargs: Optional[dict],
+):
+    unwrapped_model = unwrap_model(model)
+    if not hasattr(unwrapped_model, "_preprocess") or not hasattr(unwrapped_model, "decoder"):
+        raise TypeError(
+            "Megatron hidden extraction via extract_layer_indices requires a GPTModel-like module "
+            "with `_preprocess` and `decoder`."
+        )
+
+    preprocess_output = unwrapped_model._preprocess(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        decoder_input=None,
+        inference_context=None,
+        packed_seq_params=packed_seq_params,
+    )
+    if not isinstance(preprocess_output, (tuple, list)) or len(preprocess_output) < 5:
+        raise RuntimeError(
+            "Megatron hidden extraction expected `_preprocess` to return "
+            "(decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset, ...)."
+        )
+
+    decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = preprocess_output[:5]
+    return unwrapped_model.decoder(
+        hidden_states=decoder_input,
+        attention_mask=attention_mask,
+        inference_context=None,
+        rotary_pos_emb=rotary_pos_emb,
+        rotary_pos_cos=rotary_pos_cos,
+        rotary_pos_sin=rotary_pos_sin,
+        packed_seq_params=packed_seq_params,
+        sequence_len_offset=sequence_len_offset,
+        **(extra_block_kwargs or {}),
+    )
 
 
 def model_forward_gen(vision_model: bool = False):
@@ -169,12 +241,14 @@ def gptmodel_forward_no_padding(
     pad_token_id=None,
     data_format: str = "thd",
     enable_mtp: bool = False,
+    model_extra_kwargs: Optional[dict] = None,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
     pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
+    extract_block_kwargs = dict(model_extra_kwargs) if model_extra_kwargs else None
 
     model_kwargs = {}
     if "pixel_values" in multi_modal_inputs:
@@ -185,6 +259,8 @@ def gptmodel_forward_no_padding(
         model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
     if "video_grid_thw" in multi_modal_inputs:
         model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
+    if model_extra_kwargs:
+        model_kwargs.update(model_extra_kwargs)
 
     batch_size = input_ids.shape[0]
     if data_format == "thd":
@@ -210,13 +286,30 @@ def gptmodel_forward_no_padding(
             for i, seqlen in enumerate(seqlens_in_batch):
                 attention_mask[i, :seqlen] = True
 
-        output_orig = model(
-            input_ids=input_ids_rmpad,
-            attention_mask=attention_mask,
-            position_ids=None,
-            packed_seq_params=packed_seq_params,
-            **model_kwargs,
-        )
+        if extract_block_kwargs and extract_block_kwargs.get("extract_layer_indices"):
+            _log_extract_layer_indices_path(
+                model,
+                extra_block_kwargs=extract_block_kwargs,
+                branch=f"gptmodel_forward_no_padding:{data_format}",
+            )
+            model_kwargs.pop("extract_layer_indices", None)
+            output_orig = _forward_decoder_with_extract_layers(
+                model,
+                input_ids=input_ids_rmpad,
+                attention_mask=attention_mask,
+                position_ids=None,
+                packed_seq_params=packed_seq_params,
+                extra_block_kwargs=extract_block_kwargs,
+            )
+            return output_orig
+        else:
+            output_orig = model(
+                input_ids=input_ids_rmpad,
+                attention_mask=attention_mask,
+                position_ids=None,
+                packed_seq_params=packed_seq_params,
+                **model_kwargs,
+            )
 
         if post_process and logits_processor is not None:
             args = {
@@ -255,12 +348,29 @@ def gptmodel_forward_no_padding(
         if logits_processor_args and "loss_mask" in logits_processor_args:
             logits_processor_args.pop("loss_mask")
 
-        output_orig = model(
-            input_ids=input_ids_bshd,
-            attention_mask=attention_mask_bshd,
-            position_ids=position_ids_bshd,
-            **model_kwargs,
-        )
+        if extract_block_kwargs and extract_block_kwargs.get("extract_layer_indices"):
+            _log_extract_layer_indices_path(
+                model,
+                extra_block_kwargs=extract_block_kwargs,
+                branch=f"gptmodel_forward_no_padding:{data_format}",
+            )
+            model_kwargs.pop("extract_layer_indices", None)
+            output_orig = _forward_decoder_with_extract_layers(
+                model,
+                input_ids=input_ids_bshd,
+                attention_mask=attention_mask_bshd,
+                position_ids=position_ids_bshd,
+                packed_seq_params=None,
+                extra_block_kwargs=extract_block_kwargs,
+            )
+            return output_orig
+        else:
+            output_orig = model(
+                input_ids=input_ids_bshd,
+                attention_mask=attention_mask_bshd,
+                position_ids=position_ids_bshd,
+                **model_kwargs,
+            )
         if post_process and logits_processor is not None:
             args = {
                 k: preprocess_bshd_no_padding(v, pre_process=True, need_roll=(k == "label"))[0]

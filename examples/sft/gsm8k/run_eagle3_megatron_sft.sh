@@ -55,7 +55,6 @@ DRAFT_INIT=${DRAFT_INIT:-from_config}
 DRAFT_TRUST_REMOTE_CODE=${DRAFT_TRUST_REMOTE_CODE:-false}
 TTT_STEPS=${TTT_STEPS:-1}
 AUX_HIDDEN_LAYERS=${AUX_HIDDEN_LAYERS:-"[1,-2,-1]"}
-REUSE_TARGET_LM_HEAD=${REUSE_TARGET_LM_HEAD:-false}
 
 # mbridge currently expects hf_config.rope_theta for GPT-style models.
 # Some Qwen3 configs in older transformers builds may not expose it.
@@ -94,7 +93,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     ++model.spec_decode.draft_model.trust_remote_code="$DRAFT_TRUST_REMOTE_CODE" \
     ++model.spec_decode.strategy_config.ttt_steps="$TTT_STEPS" \
     ++model.spec_decode.strategy_config.aux_hidden_layers="$AUX_HIDDEN_LAYERS" \
-    ++model.spec_decode.strategy_config.reuse_target_lm_head="$REUSE_TARGET_LM_HEAD" \
     engine.tensor_model_parallel_size="$TP_SIZE" \
     engine.pipeline_model_parallel_size="$PP_SIZE" \
     engine.virtual_pipeline_model_parallel_size="$VPP_SIZE" \
