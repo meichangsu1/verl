@@ -43,6 +43,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
+from verl.utils.ray_utils import get_event_loop
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, fsdp2_load_full_state_dict
@@ -734,14 +735,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def initialize_drafter_training(self):
-        self._init_drafter_trainer()
-        drafter_manager = self._get_drafter_manager()
-        if drafter_manager is not None:
-            drafter_manager.background_trainer = self.drafter_trainer
-        if self.drafter_trainer is not None:
-            rollout_ranks = list(range(self.world_size))
-            await self.drafter_trainer.activate_training_model(self.drafter_device_mesh, rollout_ranks)
+    def initialize_drafter_training(self):
+        async def _impl():
+            self._init_drafter_trainer()
+            drafter_manager = self._get_drafter_manager()
+            if drafter_manager is not None:
+                drafter_manager.background_trainer = self.drafter_trainer
+            if self.drafter_trainer is not None:
+                rollout_ranks = list(range(self.world_size))
+                await self.drafter_trainer.activate_training_model(self.drafter_device_mesh, rollout_ranks)
+
+        loop = get_event_loop()
+        return loop.run_until_complete(_impl())
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE)
     def collect_drafter_samples(self, batch=None, hidden_states=None, last_hidden_states=None):
@@ -790,7 +795,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None):
+    def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout.
 
         1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
@@ -803,65 +808,70 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_config=None, so the rollout receives a standard weight update.
         """
 
-        # 0. send_weights only for async training with disaggregated trainer and rollout
-        if self.config.rollout.checkpoint_engine.backend != "naive":
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            await self.checkpoint_engine.send_weights(per_tensor_param)
-            return
+        async def _impl():
+            # 0. send_weights only for async training with disaggregated trainer and rollout
+            if self.config.rollout.checkpoint_engine.backend != "naive":
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                await self.checkpoint_engine.send_weights(per_tensor_param)
+                return
 
-        set_expandable_segments(False)
-        log_gpu_memory_usage("Before resume weights", logger=logger)
+            set_expandable_segments(False)
+            log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. resume rollout memory (weights were released during sleep)
-        # When sleep_level=1 (adapter mode), sleep() only released kv_cache,
-        # so skip the weight resume to avoid a no-op sglang call.
-        if self.config.rollout.free_cache_engine:
-            if getattr(self.rollout, "sleep_level", 2) != 1:
-                await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+            # 1. resume rollout memory (weights were released during sleep)
+            # When sleep_level=1 (adapter mode), sleep() only released kv_cache,
+            # so skip the weight resume to avoid a no-op sglang call.
+            if self.config.rollout.free_cache_engine:
+                if getattr(self.rollout, "sleep_level", 2) != 1:
+                    await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
 
-        # 2. determine if we need a base weight sync (adapter path only)
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
-        )
-
-        do_lora_base_sync = False
-        if not self.peft_merge and peft_config is not None:
-            self.rollout.sleep_level = 1
-            do_lora_base_sync = not self.base_sync_done
-
-        # 3. sync weights: base first (when needed), then adapter/merged
-        if do_lora_base_sync:
-            # First iteration: per_tensor_param has base params (base_sync_done was False).
-            # Send base weights, then fetch and send adapter deltas.
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
-            )
+            # 2. determine if we need a base weight sync (adapter path only)
             per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=True
-            )
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-            )
-        else:
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done, global_steps=global_steps
+                layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
             )
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
+            do_lora_base_sync = False
+            if not self.peft_merge and peft_config is not None:
+                self.rollout.sleep_level = 1
+                do_lora_base_sync = not self.base_sync_done
 
-        # 3. offload model to cpu
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+            # 3. sync weights: base first (when needed), then adapter/merged
+            if do_lora_base_sync:
+                await self.rollout.update_weights(
+                    per_tensor_param, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
+                )
+                per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+                    layered_summon=self.layered_summon, base_sync_done=True
+                )
+                await self.rollout.update_weights(
+                    per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+                )
+            else:
+                await self.rollout.update_weights(
+                    per_tensor_param,
+                    peft_config=peft_config,
+                    base_sync_done=self.base_sync_done,
+                    global_steps=global_steps,
+                )
 
-        # 4. resume kv_cache
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
-        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+            log_gpu_memory_usage("After update_weights", logger=logger)
 
-        self.base_sync_done = True
-        set_expandable_segments(True)
+            # 3. offload model to cpu
+            if self.actor.engine.is_param_offload_enabled:
+                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
+
+            # 4. resume kv_cache
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["kv_cache"])
+            log_gpu_memory_usage("After resume kv_cache", logger=logger)
+
+            self.base_sync_done = True
+            set_expandable_segments(True)
+
+        loop = get_event_loop()
+        return loop.run_until_complete(_impl())
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
