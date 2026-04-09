@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import glob
+import json
 import logging
 import os
 from contextlib import nullcontext
@@ -21,8 +23,10 @@ from itertools import chain
 from typing import Optional
 
 import torch
+import torch.nn as nn
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
+from safetensors import safe_open
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -41,6 +45,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
+from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, fsdp2_load_full_state_dict
 from verl.workers.config import (
     ActorConfig,
     DistillationConfig,
@@ -51,6 +56,9 @@ from verl.workers.config import (
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import ppo_loss
+from verl.workers.drafter.eagle3_trainer import EAGLE3BackgroundTrainer
+from verl.workers.drafter.manager import RolloutDrafterManager
+from verl.workers.drafter.model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -147,6 +155,114 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
 
         self.loss_fn = None
+        self.drafter_trainer = None
+        self.drafter_device_mesh = None
+
+    def _load_weight_from_dir(self, model_path: str, key: str):
+        if os.path.isdir(model_path):
+            index_files = glob.glob(os.path.join(model_path, "*.index.json"))
+            if index_files:
+                with open(index_files[0], "r") as f:
+                    index_json = json.load(f)
+                ckpt_file = index_json["weight_map"][key]
+                ckpt_path = os.path.join(model_path, ckpt_file)
+                if ckpt_path.endswith(".safetensors"):
+                    with safe_open(ckpt_path, framework="pt") as f:
+                        return f.get_tensor(key)
+                state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                return state_dict[key]
+            for filename in ("model.safetensors", "pytorch_model.bin"):
+                ckpt_path = os.path.join(model_path, filename)
+                if os.path.exists(ckpt_path):
+                    if ckpt_path.endswith(".safetensors"):
+                        with safe_open(ckpt_path, framework="pt") as f:
+                            return f.get_tensor(key)
+                    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                    return state_dict[key]
+        raise FileNotFoundError(f"Cannot find weight {key} under {model_path}")
+
+    def _get_rollout_drafter_config(self):
+        rollout_cfg = getattr(self.config, "rollout", None)
+        if rollout_cfg is not None and hasattr(rollout_cfg, "drafter"):
+            return rollout_cfg.drafter
+        return getattr(self.config, "drafter", None)
+
+    def _get_drafter_manager(self) -> Optional[RolloutDrafterManager]:
+        rollout = getattr(self, "rollout", None)
+        return getattr(rollout, "drafter_manager", None)
+
+    def build_raw_eagle3_drafter(self):
+        drafter_cfg = self._get_rollout_drafter_config()
+        if drafter_cfg is None or getattr(drafter_cfg, "speculative_algorithm", None) != "EAGLE3":
+            raise ValueError("Only EAGLE3 drafter training is supported in engine worker setup")
+
+        drafter_path = drafter_cfg.model_path
+        drafter_config = AutoDraftModelConfig.from_file(os.path.join(drafter_path, "config.json"))
+        draft_model = AutoEagle3DraftModel.from_config(drafter_config)
+
+        state_dict = {}
+        for pattern in ("*.safetensors", "*.bin", "*.pt"):
+            files = glob.glob(os.path.join(drafter_path, pattern))
+            if not files:
+                continue
+            if pattern == "*.safetensors":
+                for file in files:
+                    with safe_open(file, framework="pt") as f:
+                        for name in f.keys():
+                            state_dict[name] = f.get_tensor(name)
+            else:
+                for file in files:
+                    state_dict.update(torch.load(file, map_location="cpu", weights_only=True))
+            break
+        if state_dict:
+            draft_model.load_state_dict(state_dict, strict=False)
+
+        target_model_path = getattr(self.model_config, "path", None) or getattr(self.model_config, "local_path", None)
+        draft_model.embed_tokens.weight.data.copy_(
+            self._load_weight_from_dir(target_model_path, "model.embed_tokens.weight")
+        )
+        draft_model.embed_tokens.weight.requires_grad = False
+        draft_model.cuda()
+        return draft_model, drafter_config, target_model_path
+
+    def _init_drafter_trainer(self):
+        draft_model, drafter_config, target_model_path = self.build_raw_eagle3_drafter()
+        drafter_cfg = self._get_rollout_drafter_config()
+
+        self.drafter_device_mesh = init_device_mesh(
+            get_device_name(), mesh_shape=(self.world_size,), mesh_dim_names=["drafter"]
+        )
+        full_state = draft_model.state_dict()
+
+        fsdp_config = self.config.actor.fsdp_config if hasattr(self.config, "actor") else self.engine_config
+        mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True)
+        fsdp_kwargs = {"mesh": self.drafter_device_mesh, "mp_policy": mp_policy, "offload_policy": None}
+        apply_fsdp2(draft_model, fsdp_kwargs, fsdp_config)
+        fsdp2_load_full_state_dict(draft_model, full_state, self.drafter_device_mesh, None)
+        del full_state
+
+        train_cfg = getattr(drafter_cfg, "training", drafter_cfg)
+        train_cfg.ulysses_sequence_parallel_size = getattr(self.config.actor, "ulysses_sequence_parallel_size", 1)
+        optimizer = torch.optim.AdamW(
+            [p for p in draft_model.parameters() if p.requires_grad],
+            lr=train_cfg.lr,
+            betas=(0.9, 0.95),
+            weight_decay=getattr(train_cfg, "weight_decay", 1e-2),
+        )
+        lm_head_weight = self._load_weight_from_dir(target_model_path, "lm_head.weight")
+        base_model_lm_head = nn.Linear(lm_head_weight.shape[1], lm_head_weight.shape[0], bias=False)
+        base_model_lm_head.weight.data.copy_(lm_head_weight)
+        base_model_lm_head.weight.requires_grad = False
+
+        self.drafter_trainer = EAGLE3BackgroundTrainer(
+            drafter_module_fsdp=draft_model,
+            drafter_optimizer=optimizer,
+            drafter_lr_scheduler=None,
+            drafter_train_config=train_cfg,
+            drafter_device_mesh=self.drafter_device_mesh,
+            model_config=drafter_config,
+            base_model_lm_head=base_model_lm_head,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -600,9 +716,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
 
-            if (self.config.drafter.enable
-                and self.config.drafter.train.enable_drafter_training):
-                self.init_drafter_trainer_backend()
+            drafter_cfg = getattr(rollout_config, "drafter", None)
+            if drafter_cfg is not None and drafter_cfg.enable and drafter_cfg.enable_drafter_training:
+                self.initialize_drafter_training()
 
         # 4. build checkpoint engine
         if "actor" in self.role:
@@ -618,10 +734,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def init_drafter_trainer_backend(self):
-        await self.rollout._init_server_adapter()
-        if self.rollout.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self.rollout.server_actor.build_drafter_trainer_backend.remote(self.config)
+    async def initialize_drafter_training(self):
+        self._init_drafter_trainer()
+        drafter_manager = self._get_drafter_manager()
+        if drafter_manager is not None:
+            drafter_manager.background_trainer = self.drafter_trainer
+        if self.drafter_trainer is not None:
+            rollout_ranks = list(range(self.world_size))
+            await self.drafter_trainer.activate_training_model(self.drafter_device_mesh, rollout_ranks)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE)
+    def collect_drafter_samples(self, batch=None, hidden_states=None, last_hidden_states=None):
+        if batch is None or hidden_states is None:
+            return None
+        drafter_manager = self._get_drafter_manager()
+        if drafter_manager is not None:
+            drafter_manager.collect_online_data(batch, hidden_states, last_hidden_states=last_hidden_states)
+        return None
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))

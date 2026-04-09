@@ -39,7 +39,7 @@ class DataBuffer:
         self.buffer = deque(maxlen=max_size)
         self._current_step = 0
 
-    def add_batch(self, batch: dict[str, torch.Tensor]):
+    def add_batch(self, batch: dict[str, torch.Tensor], **extra_fields):
         """Add a batch of data to the buffer.
 
         Args:
@@ -49,8 +49,10 @@ class DataBuffer:
                 - prompts: Tensor of shape [batch_size, prompt_len]
                 - hiddens: Tensor of shape [batch_size, seq_len, hidden_dim]
         """
-        batch["step"] = self._current_step
-        self.buffer.append(batch)
+        item = dict(batch)
+        item.update(extra_fields)
+        item["step"] = self._current_step
+        self.buffer.append(item)
 
     def update_rl_step(self, step: int = None):
         """Increment the current RL step counter."""

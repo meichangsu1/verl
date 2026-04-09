@@ -50,8 +50,6 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
-from verl.workers.drafter.manager import RolloutDrafterManager
-from tensordict import TensorDict
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -142,12 +140,17 @@ class SGLangHttpServer:
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"
             )
-        if self.config.drafter.enable:
-            self.drafter_manager = RolloutDrafterManager(rollout_config=self.config, dp_rank=self.replica_rank)
 
-    async def maybe_publish(self):
-        """Get drafter weights from drafter manager"""
-        return self.drafter_manager.maybe_publish()
+    def _should_return_drafter_hidden_states(self) -> bool:
+        if not (
+            self.config.drafter.enable
+            and self.config.drafter.enable_drafter_training
+            and self.config.drafter.training.collect_hidden_states_from_sgl
+        ):
+            return False
+        collect_interval = max(1, int(self.config.drafter.training.get("collect_interval_steps", 1)))
+        current_step = 0 if self.global_steps is None else int(self.global_steps)
+        return current_step % collect_interval == 0
 
     def get_master_address(self):
         """Get master address and port for init NCCL process group."""
@@ -343,9 +346,6 @@ class SGLangHttpServer:
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
 
-        if self.config.drafter.enable and self.config.drafter.enable_drafter_training:
-            self.drafter_manager_update_rl_steps(self.global_steps)
-
     @property
     def lora_as_adapter(self) -> bool:
         return (
@@ -432,13 +432,8 @@ class SGLangHttpServer:
             request.update({"return_routed_experts": True})
 
         # return hidden states
-        should_collect = False
-        if (self.config.drafter.enable
-            and self.config.drafter.enable_drafter_training
-            and self.config.drafter.training.collect_hidden_states_from_sgl
-            and self.drafter_manager.should_collect_data_this_step()
-            ):
-            should_collect = True
+        should_collect = self._should_return_drafter_hidden_states()
+        if should_collect:
             request.update({"return_hidden_states": True})
             return_logprob = True
             request.update({"return_logprob": True})
@@ -480,16 +475,12 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        drafter_hidden_states = None
         if should_collect:
-
-            engine_hidden_states = []
-            valid_batch_indices = []  # Track which samples have valid hidden states
-
             hidden_states_data = output["meta_info"]["hidden_states"]
             hidden_states_list = []
 
             for i in range(len(hidden_states_data)):
-
                 h_states = torch.tensor(hidden_states_data[i], dtype=torch.bfloat16)
                 # Skip empty tensors
                 if h_states.numel() == 0:
@@ -497,62 +488,29 @@ class SGLangHttpServer:
                 # Ensure proper dimensions [1, hidden_dim] or [seq_len, hidden_dim]
                 if h_states.dim() == 1:
                     h_states = h_states.unsqueeze(0)
-                elif h_states.dim() == 3:
-                    h_states = h_states.squeeze(0)
+                elif h_states.dim() > 2:
+                    h_states = h_states.view(-1, h_states.size(-1))
                 hidden_states_list.append(h_states)
 
-            # Concatenate non-empty tensors
             if hidden_states_list:
-                hidden_states = torch.cat(hidden_states_list, dim=0)
-                engine_hidden_states.append(hidden_states)  # List[ Tensor([seq_len, hidden_dim])]
+                drafter_hidden_states = torch.cat(hidden_states_list, dim=0).cpu()
             else:
-                logger.warning(f"No valid hidden states found for sample {idx}, skipping collection")
+                logger.warning("No valid hidden states found for drafter collection")
 
-            # Only collect data if we have valid hidden states
-            if engine_hidden_states is not None:
-
-                # Create a filtered batch containing only samples with valid hidden states
-                filtered_batch = {}
-                batch = TensorDict(
-                    {
-                        "input_ids": torch.cat([torch.tensor(prompt_ids), torch.tensor(token_ids)], dim=0),
-                        "prompts": torch.tensor(prompts),
-                        "responses": torch.tensor(token_ids)
-                    }
-                )
-                for key, value in batch.items():
-                    if isinstance(value, torch.Tensor) and value.size(0) == len(output):
-                        # Filter batch tensor to include only valid indices
-                        filtered_batch[key] = value[valid_batch_indices]
-                    else:
-                        # Keep non-tensor or non-batch values as-is
-                        filtered_batch[key] = value
-
-                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states)
-            else:
-                logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
-
+        extra_fields = {"global_steps": self.global_steps}
+        if drafter_hidden_states is not None:
+            extra_fields["drafter_hidden_states"] = drafter_hidden_states
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields=extra_fields,
         )
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
-
-    async def build_drafter_trainer_backend(self, full_config=None):
-        # todo：add fsdp and target_config
-        if full_config is not None:
-            if full_config.actor_rollout_ref.drafter.speculative_algorithm == "EAGLE":
-                from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
-                self.drafter_manager.trainer_backend = EagleTrainerBackend(full_config)
-
-    async def train_drafter(self):
-        self.drafter_manager.run_training_loop()
 
     async def abort_all_requests(self):
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))

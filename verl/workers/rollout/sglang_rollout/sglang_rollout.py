@@ -15,6 +15,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing as mp
 import os
@@ -39,6 +40,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.drafter.manager import RolloutDrafterManager
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServerAdapter
 from verl.workers.rollout.sglang_rollout.utils import (
@@ -141,6 +143,13 @@ class ServerAdapter(BaseRollout):
         #   1 = release kv_cache only (keep base weights, adapter path)
         # Set by engine_workers.update_weights() when lora.merge=False.
         self.sleep_level = 2
+        self.drafter_manager = None
+        if self.config.drafter.enable:
+            self.drafter_manager = RolloutDrafterManager(
+                device_mesh=self.device_mesh,
+                rollout_config=self.config,
+                dp_rank=self.replica_rank,
+            )
 
     async def _init_server_adapter(self):
         if self._engine is not None:
@@ -259,7 +268,7 @@ class ServerAdapter(BaseRollout):
                     await self.sgl_update_weights_drafter(params_batch=params_batch)
                 # get drafter weights
                 if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                    drafter_weights = await self.server_actor.maybe_publish.remote()
+                    drafter_weights = self.drafter_manager.maybe_publish() if self.drafter_manager is not None else None
                     if drafter_weights is not None:
                         async for params_batch in get_named_tensor_buckets(drafter_weights,
                                                                            update_weights_bucket_bytes):
@@ -298,8 +307,12 @@ class ServerAdapter(BaseRollout):
 
         return peft_config_json, serialized_named_tensors
 
-    async def train_drafter(self):
-        await self.server_actor.train_drafter.remote()
+    def update_drafter(self):
+        if self.drafter_manager is None:
+            return
+        self.drafter_manager.increment_rl_step()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.drafter_manager.run_training_loop())
 
     async def sgl_update_weights_drafter(
             self,

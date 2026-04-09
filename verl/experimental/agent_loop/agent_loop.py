@@ -1141,6 +1141,52 @@ class AgentLoopManager:
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
 
+    def _maybe_collect_drafter_online_data(self, gen_batch_output: DataProto) -> None:
+        drafter_cfg = self.rollout_config.drafter
+        if self.worker_group is None:
+            return
+        if not (
+            drafter_cfg.enable
+            and drafter_cfg.enable_drafter_training
+            and drafter_cfg.training.collect_hidden_states_from_sgl
+        ):
+            return
+
+        hidden_states_arr = gen_batch_output.non_tensor_batch.get("drafter_hidden_states")
+        if hidden_states_arr is None or len(hidden_states_arr) == 0:
+            return
+
+        valid_indices = [i for i, item in enumerate(hidden_states_arr.tolist()) if item is not None]
+        if not valid_indices:
+            return
+
+        world_size = self.worker_group.world_size
+        index_chunks = np.array_split(np.array(valid_indices, dtype=np.int64), world_size)
+        sharded_batches = []
+        sharded_hidden_states = []
+
+        for chunk in index_chunks:
+            if len(chunk) == 0:
+                sharded_batches.append(None)
+                sharded_hidden_states.append(None)
+                continue
+
+            batch_shard = {}
+            for key, value in gen_batch_output.batch.items():
+                if isinstance(value, torch.Tensor) and value.size(0) == len(gen_batch_output):
+                    batch_shard[key] = value[chunk]
+
+            hidden_shard = [hidden_states_arr[i] for i in chunk.tolist() if hidden_states_arr[i] is not None]
+            if not batch_shard or not hidden_shard:
+                sharded_batches.append(None)
+                sharded_hidden_states.append(None)
+                continue
+
+            sharded_batches.append(batch_shard)
+            sharded_hidden_states.append(hidden_shard)
+
+        self.worker_group.collect_drafter_samples(sharded_batches, sharded_hidden_states, None)
+
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
@@ -1163,6 +1209,7 @@ class AgentLoopManager:
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.sleep()
         output = DataProto.concat(outputs)
+        self._maybe_collect_drafter_online_data(output)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

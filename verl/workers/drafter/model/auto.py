@@ -11,7 +11,7 @@ from transformers import (
     modeling_utils,
 )
 
-from .eagle.llama_eagle import LlamaForCausalLMEagle, LlamaForCausalLMEagle3
+from .eagle.llama_eagle3 import LlamaForCausalLMEagle, LlamaForCausalLMEagle3
 
 class AutoDraftModel(AutoModelForCausalLMBase):
 

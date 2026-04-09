@@ -4,7 +4,7 @@ project_name='verl_grpo_example_gsm8k_drafter'
 exp_name='qwen3_8b_function_rm_drafter'
 
 gen_tp=2
-train_sp=4
+train_sp=2
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -61,11 +61,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name=project_name \
-    trainer.experiment_name=exp_name \
-    trainer.n_gpus_per_node=8 \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${exp_name} \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=${CKPTS_DIR}
+    trainer.default_local_dir=${CKPTS_DIR} \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 $@
