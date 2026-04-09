@@ -27,6 +27,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=${MODEL_PATH} \
+    actor_rollout_ref.model.override_config.attn_implementation=sdpa \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.strategy=fsdp2 \
@@ -53,6 +54,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.load_format=auto \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=torch_native \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
