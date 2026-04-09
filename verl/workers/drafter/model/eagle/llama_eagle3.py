@@ -466,3 +466,7 @@ class LlamaModelEagle3(LlamaModelTF):
                 position_ids = torch.clamp(position_ids, 0, max_pos)
 
         return loss_list, accuracy_list
+
+
+# Keep the historical public name used by the auto-model registry.
+LlamaForCausalLMEagle3 = LlamaModelEagle3
