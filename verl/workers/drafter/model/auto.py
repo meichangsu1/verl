@@ -11,7 +11,7 @@ from transformers import (
     modeling_utils,
 )
 
-from .eagle.llama_eagle3 import LlamaForCausalLMEagle, LlamaForCausalLMEagle3
+from .eagle.llama_eagle3 import LlamaForCausalLMEagle3
 
 class AutoDraftModel(AutoModelForCausalLMBase):
 
@@ -41,16 +41,10 @@ class AutoEagle3DraftModel(AutoDraftModel):
         LlamaConfig: LlamaForCausalLMEagle3,
     }
 
-class AutoEagleDraftModel(AutoDraftModel):
-    _model_mapping = {
-        LlamaConfig: LlamaForCausalLMEagle,
-    }
-
 class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
-        "LlamaForCausalLMEagle": LlamaConfig,
     }
 
     @classmethod
