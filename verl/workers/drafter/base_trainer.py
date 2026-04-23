@@ -36,7 +36,8 @@ class DrafterBaseTrainer:
         config,
         world_size: int,
         rollout_dp_rank: int,
-        backend
+        backend,
+        training_device_mesh: DeviceMesh,
     ):
         self.config = config
         self.world_size = world_size
@@ -45,7 +46,11 @@ class DrafterBaseTrainer:
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
 
-        self.training_device_mesh = self._setup_device_mesh()
+        if training_device_mesh is None:
+            raise ValueError("training_device_mesh must be provided explicitly for DrafterBaseTrainer")
+        self.training_device_mesh = training_device_mesh
+        # Keep the FSDP wrapping mesh immutable after model initialization.
+        self._fsdp_device_mesh = self.training_device_mesh
         
         self.device_id = get_device_id()
         self.copy_stream = torch.accelerator.Stream()
@@ -89,13 +94,17 @@ class DrafterBaseTrainer:
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
 
-    def _setup_device_mesh(self):
-        infer_tp = self.config.rollout.tensor_model_parallel_size
-        dp_size = self.world_size // infer_tp
-        global_device_mesh_list = [
-            DeviceMesh(device_name, list(range(i * infer_tp, (i + 1) * infer_tp))) for i in range(dp_size)
-        ]
-        return global_device_mesh_list[self.rollout_dp_rank]
+    def _resolve_fsdp_config(self):
+        # Primary source: actor fsdp config used across PPO training stacks.
+        fsdp_config = None
+        if hasattr(self.config, "actor_rollout_ref") and hasattr(self.config.actor_rollout_ref, "actor"):
+            fsdp_config = self.config.actor_rollout_ref.actor.get("fsdp_config")
+        # Optional fallback for drafter-local overrides.
+        if fsdp_config is None:
+            fsdp_config = self.config.rollout.drafter.training.get("fsdp_config")
+        if fsdp_config is None:
+            raise ValueError("FSDP config is missing: expect actor_rollout_ref.actor.fsdp_config or drafter override")
+        return fsdp_config
 
     def _build_draft_model(self):
         """build draft model"""
@@ -108,13 +117,13 @@ class DrafterBaseTrainer:
         full_state = raw_model.state_dict()
 
         # C. FSDP包装
-        fsdp_config = self.actor.fsdp_config
+        fsdp_config = self._resolve_fsdp_config()
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
         )
 
         fsdp_kwargs = {
-            "mesh": self.training_device_mesh,
+            "mesh": self._fsdp_device_mesh,
             "mp_policy": mp_policy,
             "offload_policy": None,
         }
@@ -123,7 +132,7 @@ class DrafterBaseTrainer:
         apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
 
         # Load full state dict using the same mesh as used by drafter FSDP wrapping
-        fsdp2_load_full_state_dict(raw_model, full_state, self.training_device_mesh, None)
+        fsdp2_load_full_state_dict(raw_model, full_state, self._fsdp_device_mesh, None)
         self.model = raw_model
         del full_state
 
@@ -229,7 +238,7 @@ class DrafterBaseTrainer:
             first_param = next(self.model.parameters(), None)
             is_on_cuda = first_param is not None and first_param.device.type == "cuda"
 
-            if self.is_offload_param or is_on_cuda:
+            if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 load_fsdp_model_to_gpu(self.model)
                 logger.debug("Loaded drafter model to GPU for training")
@@ -240,7 +249,10 @@ class DrafterBaseTrainer:
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
-            self.training_device_mesh = device_mesh
+            # Do not override FSDP wrapping mesh at runtime. Keep a runtime mesh handle
+            # only for reductions/checkpoint collectives when explicitly provided.
+            if device_mesh is not None:
+                self.training_device_mesh = device_mesh
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -498,7 +510,7 @@ class DrafterBaseTrainer:
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
         # 异步进行checkpoint保存
-        if self.checkpoint_dir and (self.training_step // self.step) > self._last_ckpt_step:
+        if self.checkpoint_dir and (self.training_steps // self.step) > self._last_ckpt_step:
             # Wait for previous checkpoint to complete before starting a new one
             # This avoids queuing multiple checkpoints and excessive memory usage
             if self._pending_checkpoint_future is not None:
@@ -509,7 +521,7 @@ class DrafterBaseTrainer:
 
             # Launch async checkpoint save without blocking training
             self._pending_checkpoint_future = self._save_checkpoint_async(step, is_final=False)
-            self._last_ckpt_step = self.training_step // self.step
+            self._last_ckpt_step = self.training_steps // self.step
 
         return True
     
