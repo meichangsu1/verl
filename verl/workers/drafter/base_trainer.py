@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from collections import deque
+from contextlib import nullcontext
 from typing import Optional
 from typing import List
 from omegaconf import open_dict
@@ -53,7 +54,9 @@ class DrafterBaseTrainer:
         self._fsdp_device_mesh = self.training_device_mesh
         
         self.device_id = get_device_id()
-        self.copy_stream = torch.accelerator.Stream()
+        # torch.accelerator.Stream is not available in many PyTorch versions.
+        # Prefer CUDA stream when CUDA is enabled, otherwise disable async-copy stream.
+        self.copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         self.is_offload_param = False
         self.is_offload_optimizer = False
@@ -284,19 +287,21 @@ class DrafterBaseTrainer:
             return
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
-        with torch.cuda.stream(self.copy_stream):
+        stream_ctx = torch.cuda.stream(self.copy_stream) if self.copy_stream is not None else nullcontext()
+        with stream_ctx:
             cpu_input_ids = input_ids.to('cpu', non_blocking=True)
             cpu_h_states = hidden_states.to('cpu', non_blocking=True)
             cpu_target_logprobs = target_logprobs.to('cpu', non_blocking=True) if target_logprobs is not None else None
             cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        if self.copy_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
 
         batch_size = cpu_input_ids.size(0)
 
         # 动态计算最小序列长度
-        if cpu_target_logprobs:
+        if cpu_target_logprobs is not None:
             seq_length = min(cpu_target_logprobs.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
         else:
             seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))

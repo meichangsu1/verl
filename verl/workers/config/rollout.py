@@ -34,6 +34,10 @@ __all__ = [
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
+    "DrafterConfig",
+    "DrafterRolloutConfig",
+    "DrafterTrainingConfig",
+    # Backward-compatible aliases
     "DraftConfig",
     "DraftRolloutConfig",
     "DraftTrainingConfig",
@@ -81,7 +85,7 @@ class DrafterRolloutConfig(BaseConfig):
 
 
 @dataclass
-class DraftTrainingConfig(BaseConfig):
+class DrafterTrainingConfig(BaseConfig):
     checkpoint_path: Optional[str] = None
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
@@ -125,6 +129,12 @@ class DrafterConfig(BaseConfig):
 
     # training configuration for drafter
     training: DrafterTrainingConfig = field(default_factory=DrafterTrainingConfig)
+
+
+# Backward-compatible aliases for historical naming in configs/checkpoints.
+DraftConfig = DrafterConfig
+DraftRolloutConfig = DrafterRolloutConfig
+DraftTrainingConfig = DrafterTrainingConfig
 
 
 @dataclass
@@ -343,7 +353,7 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
-    drafter: DraftConfig = field(default_factory=DraftConfig)
+    drafter: DrafterConfig = field(default_factory=DrafterConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

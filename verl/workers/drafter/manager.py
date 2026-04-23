@@ -13,7 +13,7 @@ class RolloutDrafterManager:
         # step tracking
         self.current_rl_step = 1
         self.training_interval_steps = int(rollout_config.drafter.training.get("training_interval_steps", 1))
-        self.collection_interval_steps = int(rollout_config.drafter.training.get("collection_interval_steps", 1))
+        self.collection_interval_steps = int(rollout_config.drafter.training.get("collect_interval_steps", 1))
         self.step = rollout_config.drafter.training.get("step", 100)
 
 
