@@ -564,11 +564,20 @@ class SGLangHttpServer:
         self,
         full_config=None,
         training_device_mesh: DeviceMesh = None,
+        training_mesh_ranks: list[int] | None = None,
         rollout_dp_rank: int | None = None,
     ):
         if full_config is not None:
-            if training_device_mesh is None:
-                raise ValueError("training_device_mesh must be provided explicitly")
+            # DeviceMesh objects should be created in-process because passing them
+            # across actor boundaries can leave dangling process-group names.
+            if training_mesh_ranks is not None:
+                if not torch.distributed.is_initialized():
+                    raise RuntimeError("torch distributed must be initialized before creating training mesh")
+                if len(training_mesh_ranks) == 0:
+                    raise ValueError("training_mesh_ranks must be non-empty")
+                training_device_mesh = DeviceMesh("cpu", mesh=training_mesh_ranks)
+            elif training_device_mesh is None:
+                raise ValueError("training_mesh_ranks or training_device_mesh must be provided explicitly")
             if full_config.rollout.drafter.speculative_algorithm == "EAGLE":
                 from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
                 trainer_backend = EagleTrainerBackend(full_config, full_config.model)

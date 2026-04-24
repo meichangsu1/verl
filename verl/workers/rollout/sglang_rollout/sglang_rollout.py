@@ -186,10 +186,11 @@ class ServerAdapter(BaseRollout):
             if self.device_mesh is None:
                 raise RuntimeError("device_mesh is required to initialize drafter trainer backend")
             drafter_training_mesh = self.device_mesh["infer_tp"]
+            drafter_training_ranks = drafter_training_mesh.mesh.flatten().tolist()
             await self.server_actor.build_drafter_trainer_backend.remote(
-                self.full_config,
-                drafter_training_mesh,
-                self.replica_rank,
+                full_config=self.full_config,
+                training_mesh_ranks=drafter_training_ranks,
+                rollout_dp_rank=self.replica_rank,
             )
 
     async def resume(self, tags: list[str]):
